@@ -30,7 +30,6 @@ dynamic = [
   "version",
 ]
 dependencies = [
-  "cytoolz",
   "geopandas>=1",
   "networkx>=3",
   "numpy>=2",
