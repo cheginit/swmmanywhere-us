@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import geopandas as gpd
@@ -127,9 +127,9 @@ def _lines_to_graph(lines: list[LineString] | LineArray) -> nx.Graph[Any]:
         edge = (line.coords[0], line.coords[-1])
         k[edge] = k.get(edge, 0) + 1
         graph.add_edge(*edge, key=k[edge] - 1, geometry=line)
-    multi_edges: dict[tuple[Any, Any], list[LineString]] = {}
+    multi_edges: defaultdict[tuple[Any, Any], list[LineString]] = defaultdict(list)
     for (u, v, _), g in nx.get_edge_attributes(graph, "geometry").items():
-        multi_edges.setdefault((u, v), []).append(g)
+        multi_edges[(u, v)].append(g)
     graph = nx.DiGraph()
     graph.add_edges_from(
         (u, v, {"geometry": _collapse_lines(g)}) for (u, v), g in multi_edges.items()
