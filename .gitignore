@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+_version.py
+.coverage
+coverage.xml
+junit.xml
+
+# Pixi
+.pixi/
+pixi.lock
+
+# Cache
+.cache/
+cache/
+.ruff_cache/
+
+# Data
+data/
+WBT/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
