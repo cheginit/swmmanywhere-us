@@ -46,7 +46,6 @@ def calculate_contributing_area(
         slope_path=addresses.model_paths.slope,
         graph=graph,
         rail_path=addresses.bbox_paths.tiger_rail,
-        wbt_zip_path=addresses.project_paths.whiteboxtools_binaries_zip,
     )
 
     subs_gdf = go.derive_subcatchments(
@@ -65,8 +64,8 @@ def calculate_contributing_area(
     # ``derive_subcatchments`` now runs WBT's Watershed with every graph
     # node as a pour point, so each subcatchment polygon corresponds to
     # exactly one graph node (its ``id``).  Each node receives the full
-    # impervious area of its own subcatchment — no distribution across
-    # multiple nodes, no nearest-node fallback — which makes the
+    # impervious area of its own subcatchment, no distribution across
+    # multiple nodes, no nearest-node fallback, which makes the
     # node-level ``contributing_area`` match how SWMM actually routes the
     # subcatchment's runoff (subcatchment.Outlet = this node).  Pipe-sizing
     # flow accumulation and SWMM simulation therefore see the same
@@ -88,7 +87,7 @@ def calculate_contributing_area(
 
     nx.set_node_attributes(graph, ca_per_node, "contributing_area")
 
-    # Edge-level attribute: inherit from upstream node (unchanged behaviour)
+    # Edge-level attribute: inherit from upstream node (unchanged behavior)
     edge_attributes = {edge: graph.nodes[edge[0]]["contributing_area"] for edge in graph.edges}
     nx.set_edge_attributes(graph, edge_attributes, "contributing_area")
     return graph
@@ -101,7 +100,7 @@ def _best_touching_neighbor(
     cand: Any,
     touch_tol_m: float,
 ) -> int:
-    """Index of the resolved neighbour with the longest shared border, or -1."""
+    """Index of the resolved neighbor with the longest shared border, or -1."""
     best_j = -1
     best_overlap = -1.0
     for c in np.atleast_1d(cand).tolist():
@@ -159,7 +158,7 @@ def _reassign_orphans_by_adjacency(
             cand = tree.query(shapely.buffer(g, touch_tol_m))
             if len(cand) == 0:
                 continue
-            # pick the resolved neighbour with the longest shared border
+            # pick the resolved neighbor with the longest shared border
             best_j = _best_touching_neighbor(g, geoms, resolved_idx, cand, touch_tol_m)
             if best_j >= 0:
                 current_id[i] = current_id[best_j]
@@ -206,7 +205,7 @@ def cleanup_orphan_subcatchments(
     if subs.empty:
         return graph
 
-    # Identify SWMM outfalls — the river-side node (v) of every
+    # Identify SWMM outfalls, the river-side node (v) of every
     # ``outfall`` edge, plus the synthetic sinks that post_processing
     # routes to [OUTFALLS] by node_type alone.  Canal-anchored pond
     # chains terminate at ``river_outfall`` sinks reached via a
@@ -242,7 +241,7 @@ def cleanup_orphan_subcatchments(
     # reaches an outfall, so gluing orphans to bordering non-orphans
     # restores connectivity *and* keeps the post-merge
     # ``groupby(id).unary_union`` contiguous instead of collapsing
-    # spatially scattered orphans onto one far node — the root cause of
+    # spatially scattered orphans onto one far node, the root cause of
     # disconnected MultiPolygon pondsheds.
     reassign = _reassign_orphans_by_adjacency(subs, orphan_mask)
     if not reassign:
@@ -262,7 +261,7 @@ def cleanup_orphan_subcatchments(
     # Do NOT dissolve subcatchments that now share an outlet id.  SWMM fully
     # supports many subcatchments draining to one node, and dissolving by
     # outlet collapses the fine per-pipe subcatchments into mega-subcatchments
-    # — in pond models dozens of subs route to one pond storage and would
+    #, in pond models dozens of subs route to one pond storage and would
     # merge into a single 100+ ha polygon (the small pipe subcatchments
     # "disappearing").  Each sub keeps its own polygon and area; unique SWMM
     # names are assigned at write time (``synthetic_write``).  Pondshed

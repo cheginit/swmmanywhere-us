@@ -7,7 +7,6 @@ such as reprojecting coordinates and handling raster data.
 from __future__ import annotations
 
 import math
-import shutil
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -19,17 +18,16 @@ import numpy as np
 import orjson as json
 import pandas as pd
 import pyproj
-import pywbt
 import rasterio as rst
 import rasterio.features as rio_features
 import rioxarray as rxr
 import shapely
+import whitebox_workflows as wb
 import xarray as xr
 from pyproj.aoi import AreaOfInterest
 from pyproj.database import query_utm_crs_info
 from pyproj.exceptions import CRSError
 from pyproj.transformer import Transformer
-from pywbt import prepare_wbt, whitebox_tools
 from rasterio import features
 from scipy.ndimage import distance_transform_edt
 from shapely import geometry as sgeom
@@ -41,7 +39,7 @@ from swmmanywhere_us.logging import logger
 # Sanity bound for percent slope.  WBT Slope with --units=percent returns
 # tan(theta) * 100.  Real terrain rarely exceeds 200% (63 deg) outside
 # cliffs/quarries, so 500% is a generous ceiling: any cell above it
-# indicates a DEM conditioning artefact (stream burn, inlet dig, nodata
+# indicates a DEM conditioning artifact (stream burn, inlet dig, nodata
 # leakage) that should surface as a warning.
 _SLOPE_SANITY_MAX_PCT = 500.0
 
@@ -166,7 +164,7 @@ def raster_to_geodf(raster_path: str | Path) -> gpd.GeoDataFrame:
     preserved in a ``watershed`` column.  Polygons from disconnected
     parts of the same watershed are dissolved into a single
     (multi)polygon, and any polygon strictly contained within another
-    is dropped as vectorisation noise.
+    is dropped as vectorization noise.
 
     Args:
         raster_path: Path to the raster file.
@@ -186,7 +184,7 @@ def raster_to_geodf(raster_path: str | Path) -> gpd.GeoDataFrame:
         raise TypeError(msg)
     da = da.squeeze(drop=True)
     # 4-connectivity: 8-connectivity merges watershed cells touching only
-    # at a corner into one polygon pinched at that point — an invalid
+    # at a corner into one polygon pinched at that point, an invalid
     # (ring self-intersection) geometry.  4-connectivity keeps them as
     # separate parts, recombined per watershed by the dissolve below and
     # cleaned by _repair_disconnected_subcatchments.
@@ -208,7 +206,7 @@ def raster_to_geodf(raster_path: str | Path) -> gpd.GeoDataFrame:
     gdf = gdf.dissolve(by="watershed", as_index=False)
 
     # Drop polygons whose geometry is strictly contained within another
-    # (vectorisation sometimes produces thin slivers inside larger
+    # (vectorization sometimes produces thin slivers inside larger
     # watersheds).  The ``contains_properly`` test is run at the polygon
     # level, preserving each surviving watershed's ID.
     _, contained_idx = gdf.geometry.sindex.query(gdf.geometry, predicate="contains_properly")
@@ -260,7 +258,7 @@ def calculate_slope(
         mask = features.geometry_mask([geom], grid.shape, grid.affine, invert=True)
         vals = cell_slopes[mask & finite_cells]
         # A polygon smaller than one raster cell (e.g. a tiny Voronoi
-        # sliver) can cover no finite cell — leave it NaN here and fill
+        # sliver) can cover no finite cell, leave it NaN here and fill
         # it from the median below, so SWMM never receives a NaN slope.
         slopes[idx] = max(float(vals.mean()), 0.0) if vals.size else float("nan")
     slope_series = pd.Series(slopes)
@@ -341,41 +339,50 @@ def delineate_catchment(
     pour_pts_file = fdir.parent / "pour_points.shp"
     pour_points.to_file(pour_pts_file)
 
-    wbt_args = {
-        "D8FlowAccumulation": [
-            f"-i={fdir.name}",
-            "-o=flow_accum.tif",
-            "--pntr",
-        ],
-        "ExtractStreams": [
-            "--flow_accum=flow_accum.tif",
-            "-o=streams.tif",
-            f"--threshold={stream_accum_threshold}",
-        ],
-        "JensonSnapPourPoints": [
-            f"--pour_pts={pour_pts_file.name}",
-            "--streams=streams.tif",
-            "-o=pour_pts_snapped.shp",
-            f"--snap_dist={snap_dist}",
-        ],
-        # No post-Watershed MajorityFilter.  A 3x3 majority filter on the
-        # watershed-id raster overwrites every watershed smaller than ~5
-        # cells with its surroundings, erasing it — which orphaned ~18% of
-        # pour points here.  Those orphans were then Voronoi-split back into
-        # neighbouring catchments, slicing them with long straight lines.
-        # Raster speckle is instead repaired, watershed-aware, by
-        # _repair_disconnected_subcatchments (longest-shared-border merge).
-        "Watershed": [
-            f"--d8_pntr={fdir.name}",
-            "--pour_pts=pour_pts_snapped.shp",
-            "-o=watershed.tif",
-        ],
-    }
-    pywbt.whitebox_tools(fdir.parent, wbt_args, save_dir=fdir.parent, max_procs=1)
+    # Memory-first WhiteboxWorkflows chain: flow accumulation from the D8
+    # pointer -> stream extraction -> snap pour points onto the stream
+    # network -> watershed delineation.  The snapped pour points, the
+    # watershed raster, and the flow-accumulation raster are written to
+    # disk; the stream raster stays in memory.  flow_accum.tif must be
+    # persisted because ``assign_channel_geometry`` runs as a separate,
+    # later pipeline step and reads it back to size river channels from
+    # true upstream watershed area -- without it, channels silently fall
+    # back to the (tiny) impervious-area default.
+    #
+    # No post-Watershed MajorityFilter.  A 3x3 majority filter on the
+    # watershed-id raster overwrites every watershed smaller than ~5
+    # cells with its surroundings, erasing it, which orphaned ~18% of
+    # pour points here.  Those orphans were then Voronoi-split back into
+    # neighboring catchments, slicing them with long straight lines.
+    # Raster speckle is instead repaired, watershed-aware, by
+    # _repair_disconnected_subcatchments (longest-shared-border merge).
+    wbe = wb.WbEnvironment()
+    d8 = wbe.read_raster(str(fdir))
+    flow_accum = wbe.hydrology.d8_flow_accum(input=d8, input_is_pointer=True, out_type="cells")
+    streams = wbe.streams.extract_streams(
+        flow_accumulation=flow_accum, threshold=stream_accum_threshold
+    )
+    snapped = wbe.hydrology.jenson_snap_pour_points(
+        pour_pts=wbe.read_vector(str(pour_pts_file)),
+        streams=streams,
+        snap_dist=snap_dist,
+    )
+    # Persist the snapped pour points: derive_subcatchments reads this file
+    # back to recover the node_id -> watershed-id mapping.  Watershed IDs
+    # are 1-based in pour-point feature order, so the same ``snapped`` object
+    # feeds Watershed to keep the raster IDs and shapefile rows aligned.
+    wbe.write_vector(snapped, str(fdir.parent / "pour_pts_snapped.shp"))
+    watershed = wbe.hydrology.watershed(d8_pntr=d8, pour_pts=snapped)
+
+    # Persist the flow-accumulation raster (cell counts) for the later
+    # assign_channel_geometry step (graph_functions/design.py).
+    wbe.write_raster(flow_accum, str(fdir.parent / "flow_accum.tif"))
+
+    watershed_path = fdir.parent / "watershed.tif"
+    wbe.write_raster(watershed, str(watershed_path))
 
     # Fill gaps: cells whose D8 flow paths don't reach any pour point
     # are assigned to the nearest delineated watershed.
-    watershed_path = fdir.parent / "watershed.tif"
     _fill_watershed_gaps(watershed_path)
 
     return raster_to_geodf(watershed_path)
@@ -387,7 +394,6 @@ def compute_flow_direction(
     slope_path: Path,
     graph: nx.Graph[Any] | None = None,
     rail_path: Path | None = None,
-    wbt_zip_path: Path | None = None,
 ) -> None:
     """Condition a DEM and compute flow direction and slope using WhiteboxTools.
 
@@ -397,12 +403,12 @@ def compute_flow_direction(
     Slope is computed on the ORIGINAL hydroflattened DEM (not the
     stream-burned / breached DEM).  Stream burning (Hellweger 1997 AGREE;
     Saunders 1999 FillBurn) drops stream cells by tens to hundreds of
-    metres by construction.  Differentiating across those discontinuities
-    yields slopes of 10,000%+ — artefacts of flow-routing conditioning,
+    meters by construction.  Differentiating across those discontinuities
+    yields slopes of 10,000%+, artifacts of flow-routing conditioning,
     not terrain.  Callow et al. 2007 (J. Hydrol. 332:30-39) measured that
     stream burning caused "the largest increase in individual cell slope"
     of any tested conditioning method; Lindsay 2016 (Earth Surf. Proc.
-    Landforms 41:658-668) documents the artefact and recommends
+    Landforms 41:658-668) documents the artifact and recommends
     topology-preserving variants explicitly to avoid terrain-derivative
     contamination.  Maidment 2002 (Arc Hydro) treats slope and flow
     direction as independent derived products: the raw DEM feeds the
@@ -422,38 +428,24 @@ def compute_flow_direction(
             burning into the DEM. If None, no burning is performed.
         rail_path: Filepath to the rail lines for burning into
             the DEM. If None, no rail burning is performed.
-        wbt_zip_path: Path to WhiteboxTools binaries.
     """
-    with tempfile.TemporaryDirectory(dir=str(fid.parent)) as temp_dir:
-        temp_path = Path(temp_dir)
+    wbe = wb.WbEnvironment()
+    dem = wbe.read_raster(str(fid))
 
-        shutil.copy(fid, temp_path / "dem.tif")
-        wbt_root = temp_path / "WBT"
-        prepare_wbt(wbt_root, zip_path=wbt_zip_path)
+    # Slope is always computed on the original hydroflattened DEM.
+    slope = wbe.terrain.slope(input=dem, units="percent")
+    wbe.write_raster(slope, str(slope_path))
 
-        # Slope is always computed on the original hydroflattened DEM.
-        wbt_slope = {"Slope": ["-i=dem.tif", "-o=slope.tif", "--units=percent"]}
-        whitebox_tools(
-            temp_path,
-            wbt_slope,
-            save_dir=temp_path,
-            wbt_root=wbt_root,
-            zip_path=wbt_zip_path,
-            max_procs=1,
-        )
-
-        if graph is None:
-            wbt_args = {
-                "BreachDepressionsLeastCost": [
-                    "-i=dem.tif",
-                    "--dist=150",
-                    "--min_dist",
-                    "--fill",
-                    "-o=dem_corr.tif",
-                ],
-                "D8Pointer": ["-i=dem_corr.tif", "-o=fdir.tif"],
-            }
-        else:
+    if graph is None:
+        conditioned = dem
+    else:
+        # Step 1: Burn streets/rail into the DEM (stream burning, AGREE).
+        # FillBurn takes the burn lines as a vector, so write them to a
+        # temporary shapefile and read them back as a WbW vector.  The burned
+        # DEM returned by FillBurn is a memory object, so it outlives the
+        # temporary directory.
+        with tempfile.TemporaryDirectory(dir=str(fid.parent)) as temp_dir:
+            busn_path = Path(temp_dir) / "busn.shp"
             busn_gdf = gpd.GeoDataFrame(
                 geometry=list(nx.get_edge_attributes(graph, "geometry").values()),
                 crs=graph.graph["crs"],
@@ -468,73 +460,37 @@ def compute_flow_direction(
                     shapely.node(shapely.union_all([*busn_gdf.geometry.to_numpy(), *rail_lines]))
                 )
                 all_geoms = shapely.get_parts(all_geoms)
-                gpd.GeoDataFrame(geometry=all_geoms, crs=graph.graph["crs"]).to_file(
-                    temp_path / "busn.shp"
-                )
+                gpd.GeoDataFrame(geometry=all_geoms, crs=graph.graph["crs"]).to_file(busn_path)
             else:
-                busn_gdf[["geometry"]].to_file(temp_path / "busn.shp")
-            # Step 1: Burn streets/rail into DEM (stream burning, AG2)
-            wbt_burn = {
-                "FillBurn": [
-                    "--dem=dem.tif",
-                    "--streams=busn.shp",
-                    "-o=dem_burn.tif",
-                ],
-            }
-            whitebox_tools(
-                temp_path,
-                wbt_burn,
-                save_dir=temp_path,
-                wbt_root=wbt_root,
-                zip_path=wbt_zip_path,
-                max_procs=1,
-            )
+                busn_gdf[["geometry"]].to_file(busn_path)
+            conditioned = wbe.hydrology.fill_burn(dem=dem, streams=wbe.read_vector(str(busn_path)))
 
-            # Step 2: Breach remaining depressions + compute flow direction
-            wbt_args = {
-                "BreachDepressionsLeastCost": [
-                    "-i=dem_burn.tif",
-                    "--dist=150",
-                    "--min_dist",
-                    "--fill",
-                    "-o=dem_corr.tif",
-                ],
-                "D8Pointer": ["-i=dem_corr.tif", "-o=fdir.tif"],
-            }
+    # Breach remaining depressions (--dist=150 --min_dist --fill), then
+    # compute the D8 flow-direction pointer.
+    breached = wbe.hydrology.breach_depressions_least_cost(
+        dem=conditioned, max_dist=150, minimize_dist=True, fill_deps=True
+    )
+    fdir = wbe.hydrology.d8_pointer(dem=breached)
+    wbe.write_raster(fdir, str(fdir_path))
 
-        whitebox_tools(
-            temp_path,
-            wbt_args,
-            save_dir=temp_path,
-            wbt_root=wbt_root,
-            zip_path=wbt_zip_path,
-            max_procs=1,
-        )
+    if not Path(fdir_path).exists():
+        msg = "Flow direction raster not created."
+        raise ValueError(msg)
 
-        fdir = temp_path / "fdir.tif"
-        if not fdir.exists():
-            msg = "Flow direction raster not created."
-            raise ValueError(msg)
-        shutil.copy(fdir, fdir_path)
-
-        slope = temp_path / "slope.tif"
-        if not slope.exists():
-            msg = "Slope raster not created."
-            raise ValueError(msg)
-        with rst.open(slope) as src:
-            slope_data = src.read(1)
-            slope_valid = slope_data[np.isfinite(slope_data)]
-            if slope_valid.size > 0:
-                slope_max = float(slope_valid.max())
-                if slope_max > _SLOPE_SANITY_MAX_PCT:
-                    logger.warning(
-                        f"Slope raster max = {slope_max:.0f}% — implausibly high "
-                        f"(> {_SLOPE_SANITY_MAX_PCT}%).  Slope should be computed on "
-                        "a natural DEM; check for elevation artefacts."
-                    )
-        shutil.copy(slope, slope_path)
-
-        shutil.rmtree(wbt_root)
+    if not Path(slope_path).exists():
+        msg = "Slope raster not created."
+        raise ValueError(msg)
+    with rst.open(slope_path) as src:
+        slope_data = src.read(1)
+        slope_valid = slope_data[np.isfinite(slope_data)]
+        if slope_valid.size > 0:
+            slope_max = float(slope_valid.max())
+            if slope_max > _SLOPE_SANITY_MAX_PCT:
+                logger.warning(
+                    f"Slope raster max = {slope_max:.0f}%, implausibly high "
+                    f"(> {_SLOPE_SANITY_MAX_PCT}%).  Slope should be computed on "
+                    "a natural DEM; check for elevation artifacts."
+                )
 
 
 def _repair_disconnected_subcatchments(
@@ -609,10 +565,10 @@ def _merge_nested_subcatchments(  # noqa: C901 - enclosure scan + chain resoluti
     """Dissolve fully-enclosed (nested) subcatchments into their container.
 
     WBT can delineate a small watershed completely surrounded by a
-    larger one — a pocket — and the dissolve/rehome merge steps can
+    larger one, a pocket, and the dissolve/rehome merge steps can
     likewise leave one subcatchment enclosing another.  Each
     fully-enclosed subcatchment is dissolved into its smallest enclosing
-    neighbour: ``area`` and ``impervious_area`` are summed, ``rc`` and
+    neighbor: ``area`` and ``impervious_area`` are summed, ``rc`` and
     ``slope`` become area-weighted means, ``width`` = sqrt(area / pi).
     Columns absent from the input are simply not produced.
     """
@@ -693,7 +649,7 @@ def _merge_nested_subcatchments(  # noqa: C901 - enclosure scan + chain resoluti
 def _components_within_tol(parts: np.ndarray, tol_m: float) -> list[np.ndarray]:
     """Group part geometries whose ``tol_m`` buffers overlap.
 
-    Returns a list of index arrays — one per connected component.
+    Returns a list of index arrays, one per connected component.
     """
     n = int(parts.size)
     parent = np.arange(n)
@@ -774,8 +730,8 @@ def _floodfill_component_ids(
 ) -> None:
     """In place: detached components inherit a bordering keeper's id.
 
-    Iterative flood-fill — an unresolved component adopts the resolved
-    neighbour it shares the longest buffered border with, so chains of
+    Iterative flood-fill, an unresolved component adopts the resolved
+    neighbor it shares the longest buffered border with, so chains of
     detached parts resolve back through space they actually touch.  True
     islands (no bordering resolved component) fall back to the nearest
     resolved component by polygon distance.
@@ -804,7 +760,7 @@ def _floodfill_component_ids(
                 if ov > best_ov:
                     best_ov, best_j = ov, j
             # require a real (non-zero) shared border, not just a
-            # bbox-prefilter hit, before adopting the neighbour's id —
+            # bbox-prefilter hit, before adopting the neighbor's id, 
             # otherwise a component could glue to a sub it doesn't touch
             # and stay disconnected.  Untouched comps wait for a later
             # iteration (a closer comp resolves) or the island fallback.
@@ -830,11 +786,11 @@ def rehome_detached_components(
     Merge steps (``_aggregate_subcatchments``,
     ``cleanup_orphan_subcatchments``) regroup subs onto one outlet via
     the *pipe* node mapping, so ``unary_union`` yields a disconnected
-    MultiPolygon when the grouped subs are spatially separated — which
+    MultiPolygon when the grouped subs are spatially separated, which
     propagates straight into the pondsheds built from them.  Here each
     subcatchment's largest connected component (parts within ``tol_m``
     count as one component) keeps its ``id``; every detached component
-    is flood-filled into the neighbouring subcatchment it shares the
+    is flood-filled into the neighboring subcatchment it shares the
     longest border with.  Because each re-homed component physically
     borders the component it joins, every resulting subcatchment is
     contiguous.
@@ -907,8 +863,8 @@ def _clean_polygon(geom: Any) -> Any | None:
     """Return a valid polygonal geometry, or ``None`` if it has no area.
 
     ``shapely.intersection`` of a Voronoi cell with a subcatchment can
-    yield an invalid (self-touching) polygon, or — when they meet only
-    along an edge — a line/point/GeometryCollection.  A subcatchment
+    yield an invalid (self-touching) polygon, or, when they meet only
+    along an edge, a line/point/GeometryCollection.  A subcatchment
     geometry must be a valid Polygon/MultiPolygon, otherwise downstream
     raster sampling (``calculate_slope``) produces NaN and SWMM runoff
     blows up.  This repairs the geometry and keeps only its area parts.
@@ -919,7 +875,7 @@ def _clean_polygon(geom: Any) -> Any | None:
         geom = shapely.make_valid(geom)
     if geom.geom_type in ("Polygon", "MultiPolygon"):
         return geom if not shapely.is_empty(geom) else None
-    # GeometryCollection / line / point leftovers — keep polygonal parts.
+    # GeometryCollection / line / point leftovers, keep polygonal parts.
     polys = [
         g
         for g in shapely.get_parts(np.asarray([geom], dtype=object))
@@ -938,7 +894,7 @@ def _voronoi_pieces(
 ) -> list[tuple[int, Any]]:
     """Voronoi-partition ``poly`` among ``pts``.
 
-    Returns ``(node_id, piece)`` pairs — each piece is a Voronoi cell
+    Returns ``(node_id, piece)`` pairs, each piece is a Voronoi cell
     clipped to ``poly`` and repaired to a valid polygon.  The cells tile
     ``poly`` exactly, so the split conserves area.
     """
@@ -969,7 +925,7 @@ def _split_merged_watersheds(
     WBT ``Watershed`` produces one polygon per *snapped* pour-point
     cell, so graph nodes that ``JensonSnapPourPoints`` snapped into a
     shared cell all fall inside one polygon and only one of them carries
-    an ``id`` — the rest get no subcatchment.  Every polygon that
+    an ``id``, the rest get no subcatchment.  Every polygon that
     geometrically contains more than one pour point is Voronoi-split
     among those points (clipped to the polygon, area conserved), so each
     junction ends up with its own contiguous subcatchment.  Pour points
@@ -997,6 +953,7 @@ def _split_merged_watersheds(
     out_ids: list[int] = []
     out_geoms: list[Any] = []
     n_split = 0
+    dropped = 0
     for pid, members in group.items():
         pts = [pp_geom[m] for m in members if m in pp_geom]
         mids = [m for m in members if m in pp_geom]
@@ -1004,15 +961,23 @@ def _split_merged_watersheds(
             out_ids.append(pid)
             out_geoms.append(poly_by_id[pid])
             continue
-        for nid, piece in _voronoi_pieces(poly_by_id[pid], pts, mids):
+        pieces = _voronoi_pieces(poly_by_id[pid], pts, mids)
+        for nid, piece in pieces:
             out_ids.append(nid)
             out_geoms.append(piece)
+        dropped += len(mids) - len({nid for nid, _ in pieces})
         n_split += 1
 
     logger.info(
         f"derive_subcatchments: Voronoi-split {n_split} merged watershed(s); "
         f"{len(polys_gdf)} -> {len(out_ids)} subcatchments."
     )
+    if dropped:
+        logger.warning(
+            f"derive_subcatchments: {dropped} pour point(s) lost their subcatchment to "
+            f"degenerate Voronoi slivers; their runoff is rerouted by "
+            f"cleanup_orphan_subcatchments."
+        )
     return gpd.GeoDataFrame({"id": out_ids}, geometry=out_geoms, crs=polys_gdf.crs)
 
 
@@ -1037,7 +1002,7 @@ def derive_subcatchments(
     Returns:
         GeoDataFrame with columns: 'geometry', 'area', 'id', 'width', 'slope'.
     """
-    # Build pour points from graph nodes with degree > 2
+    # Build pour points from every graph node with coordinates (see below).
     with rst.open(fdir_path) as src:
         bbox = sgeom.box(*src.bounds)
         grid = Grid(src.transform, (src.height, src.width), src.crs, src.bounds)
@@ -1048,7 +1013,7 @@ def derive_subcatchments(
     # (not just degree>2 intersections) gives each node its own small
     # watershed.  That eliminates the "multiple manholes in one subcatchment"
     # ambiguity and aligns the surface routing with the pipe-network
-    # topology — so pipe sizing (which accumulates per-node contributing
+    # topology, so pipe sizing (which accumulates per-node contributing
     # area along the pipe tree) matches SWMM's subcatchment-to-Outlet
     # routing exactly.
     pour_data = [
@@ -1063,9 +1028,9 @@ def derive_subcatchments(
         raise ValueError(msg)
     node_ids, xs, ys = zip(*pour_data)
     # Attach node_id as an attribute so WBT's JensonSnapPourPoints preserves
-    # the mapping through snapping — the snapped shapefile retains this
+    # the mapping through snapping, the snapped shapefile retains this
     # column, letting us look up the outlet by spatial ``contains`` rather
-    # than (unreliable) nearest-neighbour.
+    # than (unreliable) nearest-neighbor.
     pour_points = gpd.GeoDataFrame(
         {"node_id": list(node_ids)},
         geometry=gpd.points_from_xy(xs, ys),
@@ -1074,7 +1039,7 @@ def derive_subcatchments(
 
     # Delineate catchments.  The returned polygons carry a ``watershed``
     # column whose value matches the 1-based row index (FID+1) of the
-    # corresponding pour point in the snapped shapefile — exactly the
+    # corresponding pour point in the snapped shapefile, exactly the
     # mapping WBT's Watershed tool writes into its output raster.
     polys_gdf = delineate_catchment(fdir_path, pour_points, min_drainage_area_m2)
 
@@ -1108,13 +1073,16 @@ def derive_subcatchments(
     # cell, so WBT Watershed delineates a single polygon for them and
     # all but one node end up with no subcatchment.  Voronoi-split every
     # polygon that contains more than one pour point so each junction
-    # gets its own contiguous subcatchment (area conserved).
-    polys_gdf = _split_merged_watersheds(polys_gdf, pour_points)
+    # gets its own contiguous subcatchment (area conserved).  Seed the
+    # split with the SNAPPED pour points (where WBT actually placed each
+    # outlet) rather than the original coordinates, so a polygon's own
+    # outlet seed lies inside it and is not dropped by the partition.
+    polys_gdf = _split_merged_watersheds(polys_gdf, snapped_pour)
 
     # Repair disconnected (MultiPolygon) subcatchments.  WBT's raster
     # Watershed occasionally assigns a detached sliver to a pour point
     # whose main body is elsewhere (D8 divide / raster-resolution
-    # artifact).  A subcatchment must be a single contiguous polygon —
+    # artifact).  A subcatchment must be a single contiguous polygon, 
     # otherwise any pondshed built by unioning subs inherits the
     # disconnection.  Each detached part is reassigned to the adjacent
     # subcatchment it shares the longest boundary with (falls back to
@@ -1169,13 +1137,18 @@ def derive_rc(
     if nodata is not None:
         imperv_data[imperv_data == nodata] = np.nan
 
-    subcatchments["rc"] = 0.0
+    # NaN marks "no impervious cell captured" so the median fallback below can
+    # distinguish a genuine 0 % from an unsampled subcatchment.
+    subcatchments["rc"] = np.nan
     for idx, geom in zip(subcatchments.index, subcatchments.geometry):
         mask = features.rasterize(
             [(geom, 1)],
             out_shape=imperv_data.shape,
             transform=transform,
             fill=0,
+            # all_touched: a Voronoi sliver smaller than one NLCD cell still
+            # samples the cell(s) it overlaps instead of capturing nothing.
+            all_touched=True,
             dtype="uint8",
         )
         if mask is None:
@@ -1185,6 +1158,20 @@ def derive_rc(
         valid = values[~np.isnan(values)]
         if valid.size > 0:
             subcatchments.loc[idx, "rc"] = float(np.mean(valid))
+
+    # Any subcatchment that still captured no valid cell would otherwise get
+    # rc=0 -> impervious_area=0, silently dropping its area from the mass
+    # balance.  Fill it with the median rc of the sampled subcatchments
+    # (mirrors calculate_slope's NaN->median fill) and warn.
+    sampled = subcatchments["rc"].notna()
+    n_missing = int((~sampled).sum())
+    if n_missing:
+        fallback = float(subcatchments.loc[sampled, "rc"].median()) if sampled.any() else 0.0
+        logger.warning(
+            f"derive_rc: {n_missing} subcatchment(s) captured no impervious cell; "
+            f"filled rc with median {fallback:.1f}%."
+        )
+        subcatchments["rc"] = subcatchments["rc"].fillna(fallback)
 
     subcatchments["impervious_area"] = subcatchments["rc"] / 100 * subcatchments["area"]
     return subcatchments
@@ -1265,7 +1252,7 @@ def graph_to_geojson(graph: nx.Graph[Any], fid_nodes: Path, fid_edges: Path, crs
 
 
 @overload
-def simplify_geometry(
+def simplify_geometry[GeomType: (LineString, MultiLineString, Polygon, MultiPolygon, BaseGeometry)](
     geometry: GeomType,
     tol_init: float,
     threshold_factor: float = 1.5,
@@ -1282,7 +1269,7 @@ def simplify_geometry(
 ) -> GeomArray: ...
 
 
-def simplify_geometry(
+def simplify_geometry[GeomType: (LineString, MultiLineString, Polygon, MultiPolygon, BaseGeometry)](
     geometry: GeomType | GeomArray,
     tol_init: float,
     threshold_factor: float = 1.5,

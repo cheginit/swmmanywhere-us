@@ -92,7 +92,7 @@ class ProjectPaths:
     """Paths for the project folder (within base_dir)."""
 
     def __init__(self, base_dir: Path, project_name: str, **kwargs: Path):
-        """Initialise the project paths.
+        """Initialize the project paths.
 
         Args:
             base_dir (Path): The base directory.
@@ -121,11 +121,6 @@ class ProjectPaths:
         """The national scale rail file."""
         return self.overrides.get("national_rail", self.national / "rail.parquet")
 
-    @property
-    def whiteboxtools_binaries_zip(self) -> Path:
-        """The zipped whitebox tools binaries folder."""
-        return self.overrides.get("whiteboxtools_binaries_zip", self.project / "whitebox_tools.zip")
-
 
 class BBoxPaths:
     """Paths for the bounding box folder (within project folder)."""
@@ -137,7 +132,7 @@ class BBoxPaths:
         bbox_number: int | None = None,
         **kwargs: Path,
     ):
-        """Initialise the bounding box paths.
+        """Initialize the bounding box paths.
 
         Args:
             project_paths (ProjectPaths): The project paths.
@@ -233,7 +228,7 @@ class ModelPaths:
         model_number: int | None = None,
         **kwargs: Path,
     ):
-        """Initialise the model paths.
+        """Initialize the model paths.
 
         Args:
             bbox_paths (BBoxPaths): The bounding box paths.
@@ -250,12 +245,12 @@ class ModelPaths:
 
     @property
     def model(self) -> Path:
-        """The model folder (one specific synthesised model)."""
+        """The model folder (one specific synthesized model)."""
         return self.overrides.get("model", self.base_dir / f"model_{self.model_number}")
 
     @property
     def inp(self) -> Path:
-        """The synthesised SWMM input file for the model."""
+        """The synthesized SWMM input file for the model."""
         return self.overrides.get("inp", self.model / f"model_{self.model_number}.inp")
 
     @property
@@ -327,7 +322,7 @@ class FilePaths:
         model_number: int | None = None,
         **kwargs: Path,
     ):
-        """Initialise the file paths.
+        """Initialize the file paths.
 
         Args:
             base_dir (Path): Base directory.
