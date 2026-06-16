@@ -244,8 +244,6 @@ typeCheckingMode = "strict"
 include = [ "src" ]
 ignore = [
   "docs/*.py",
-  "docs/notebooks/*.ipynb",
-  "docs/notebooks/*.py",
   "tests/*.py",
 ]
 # Third-party libs in scientific Python often lack complete stubs
