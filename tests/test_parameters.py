@@ -59,7 +59,7 @@ def test_outfall_derivation_defaults():
     """Verify OutfallDerivation default values are preserved."""
     od = OutfallDerivation()
     assert od.river_buffer_distance == 150.0
-    assert od.outfall_length == 40.0
+    assert od.outfall_clustering_factor == 1.0
 
 
 def test_topology_derivation_defaults():
@@ -90,7 +90,7 @@ def test_hydraulic_design_defaults():
 def test_parameter_override():
     """Verify parameter overrides work correctly."""
     params = get_full_parameters()
-    params["outfall_derivation"].outfall_length = 5
+    params["outfall_derivation"].outfall_clustering_factor = 2.0
     params["outfall_derivation"].river_buffer_distance = 30
-    assert params["outfall_derivation"].outfall_length == 5
+    assert params["outfall_derivation"].outfall_clustering_factor == 2.0
     assert params["outfall_derivation"].river_buffer_distance == 30

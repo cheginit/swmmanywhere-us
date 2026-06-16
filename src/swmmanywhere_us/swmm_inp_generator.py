@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .swmm_defaults import (
+from swmmanywhere_us.swmm_defaults import (
     AquiferDefaults,
     BuildupDefaults,
     ConduitDefaults,

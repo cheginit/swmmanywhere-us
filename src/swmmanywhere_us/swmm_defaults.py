@@ -99,7 +99,7 @@ class SWMMOptions(BaseModel):
     flow_routing: FlowRouting = "DYNWAVE"
     link_offsets: LinkOffsets = "DEPTH"
     # MIN_SLOPE enforces a minimum conduit slope; SWMM overrides computed
-    # slopes below this threshold.  A non-zero value stabilises flat-terrain
+    # slopes below this threshold.  A non-zero value stabilizes flat-terrain
     # routing by preventing numerical issues with near-horizontal pipes.
     # Matches the value used by the site's calibrated reference model.
     min_slope: float = 0.001
@@ -125,7 +125,7 @@ class SWMMOptions(BaseModel):
     variable_step: float = 0.75
     # SWMM short-conduit lengthening for stability: any conduit shorter
     # than v · lengthening_step is internally lengthened.  Tested on
-    # the test catchment at 5 s and 30 s — both let the time step grow but
+    # the test catchment at 5 s and 30 s, both let the time step grow but
     # DYNWAVE then can't iterate enough per step, producing 45-87 %
     # non-convergence and -10 % routing continuity.  Keeping at 0
     # (SWMM default) trades runtime for accuracy: ~12 min on the test catchment with
@@ -134,7 +134,7 @@ class SWMMOptions(BaseModel):
     # model rather than running batches.
     lengthening_step: float = 0.0
     # SWMM-recommended dummy surface area at junctions (SWMM manual Sec.
-    # A.5) — stabilises DYNWAVE at tiny/shallow manholes that would
+    # A.5), stabilizes DYNWAVE at tiny/shallow manholes that would
     # otherwise see rapid level changes and fail iteration convergence.
     # 1.167 m^2 = 12.57 sq ft, the EPA SWMM reference value.
     min_surfarea: float = 1.167
@@ -147,7 +147,7 @@ class SWMMOptions(BaseModel):
     lat_flow_tol: float = 5.0
     minimum_step: float = 0.5
     threads: int = 1
-    # SLOT = Preissmann slot method for pressurised pipe flow — far more
+    # SLOT = Preissmann slot method for pressurized pipe flow, far more
     # stable than the default EXTRAN surcharge solver when pipes surcharge
     # (which is the whole point of dual-drainage overlays).  Dobson et al.
     # (2025) also flagged EXTRAN instability in flat-terrain SWMManywhere
@@ -379,7 +379,7 @@ class StorageDefaults:
     **SurDepth** column (additional depth above ``MaxDepth`` where water
     can pond on the surface before being lost to the flooding-loss
     term).  The optional trailing Green-Ampt columns (``psi``, ``ksat``,
-    ``imd``) describe exfiltration through the pond bottom — used for
+    ``imd``) describe exfiltration through the pond bottom, used for
     closed-basin retention ponds that depend on percolation rather than
     gravity outflow to drain (common in flat coastal Florida).  When any
     of these are non-zero, the row is extended with their values.
@@ -392,7 +392,7 @@ class StorageDefaults:
     coefficient: float = 1000.0
     exponent: float = 0.0
     constant: float = 0.0
-    ponded_area: float = 0.0  # SWMM SurDepth — above-MaxDepth ponding (not a planar area)
+    ponded_area: float = 0.0  # SWMM SurDepth, above-MaxDepth ponding (not a planar area)
     evap_frac: float = 0.0
     psi: float = 0.0  # Green-Ampt suction head (mm or inches)
     ksat: float = 0.0  # Green-Ampt saturated conductivity (mm/hr or in/hr)
@@ -586,12 +586,12 @@ class OrificeDefaults:
     only (gate, check valve, or flapped culvert).  With the SWMM SIDE
     orifice + ``FlapGate=NO``, when the downstream junction surcharges
     above the pond's water level the orifice runs reversed and water
-    flows from the network *back* into the pond — exactly the
-    behaviour observed on the test catchment when multiple ponds share a ds_node and
+    flows from the network *back* into the pond, exactly the
+    behavior observed on the test catchment when multiple ponds share a ds_node and
     one of them peaks (pond 1226's 57 ha pondshed surcharges junction
     196 to 1.8 m, reversing the 1226 and 1238 orifices for ~5 hours).
     ``FlapGate=YES`` forces SWMM to clip negative flow to zero,
-    restoring detention-basin behaviour.
+    restoring detention-basin behavior.
     """
 
     orifice_type: OrificeType = "SIDE"
@@ -657,7 +657,11 @@ class WeirDefaults:
 
     weir_type: WeirType = "TRANSVERSE"
     crest_height: float = 0.0
-    disch_coeff: float = 3.33
+    # SI sharp-crested transverse-weir coefficient (matches the default
+    # metric/LPS flow units).  This is only a fallback: post_processing emits
+    # an explicit flow-unit-converted ``disch_coeff`` for every pond weir, so
+    # the value here is used only if a weir is written without one.
+    disch_coeff: float = 1.84
     flap_gate: YesNo = "YES"
     end_con: float = 0.0
     end_coeff: float = 0.0

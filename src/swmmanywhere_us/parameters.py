@@ -44,8 +44,22 @@ class OutfallDerivation(BaseModel):
     river_buffer_distance: float = Field(
         default=150.0, ge=10.0, le=500.0, description="Buffer distance to link rivers to streets."
     )
-    outfall_length: float = Field(
-        default=40.0, ge=0.0, le=600.0, description="Weight to discourage drainage into rivers."
+    outfall_clustering_factor: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Outfall consolidation strength, as a multiple of the network's median "
+            "pipe length.  identify_outfalls penalizes each candidate street->outfall "
+            "link in the minimum spanning tree by ``factor * median_pipe_length``, so "
+            "a cluster of streets collapses onto one shared outfall when they are "
+            "linked by pipes shorter than that penalty.  Expressing it relative to "
+            "pipe length (rather than an absolute distance) keeps outfall density "
+            "consistent across dense and sparse networks: factor < 1 keeps outfalls "
+            "local (little consolidation), factor > 1 merges aggressively, 0 disables "
+            "consolidation entirely.  This is a selection weight only, the retained "
+            "outfall conduit's length is the real street-to-receiving-water distance."
+        ),
     )
     include_water_body_outfalls: bool = Field(
         default=False,
@@ -95,6 +109,19 @@ class OutfallDerivation(BaseModel):
             "feeder trunks.  0 (default) intakes every pond."
         ),
     )
+    pond_footprint_match_m: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Maximum distance between a pond's STORAGE node and a basin polygon "
+            "for that polygon to be taken as the pond's own footprint (only used "
+            "when online_pond_intake).  insert_pond_nodes places the storage node "
+            "at the basin centroid, so the match is near-exact; this small "
+            "tolerance stops a stray storage node from grabbing a distant polygon. "
+            "Storage nodes with no basin within this distance are left off-line."
+        ),
+    )
 
 
 class TopologyDerivation(BaseModel):
@@ -120,10 +147,10 @@ class TopologyDerivation(BaseModel):
             "Eqs. 4-5) applied while the Dijkstra forest is grown in "
             "derive_topology: extending the forest with a pipe costs an extra "
             "scaling * C_theta(angle between the pipe and the junction's "
-            "already-chosen downstream pipe).  C_theta favours straight-"
+            "already-chosen downstream pipe).  C_theta favors straight-"
             "through junctions (180 deg, cost 0) and street-grid right angles "
-            "(90 deg, cost 0.2) and penalises acute turns (cost 1).  Unlike "
-            "the entries in `weights`, this is a transition cost — it cannot "
+            "(90 deg, cost 0.2) and penalizes acute turns (cost 1).  Unlike "
+            "the entries in `weights`, this is a transition cost, it cannot "
             "be precomputed per edge.  Default 0.3 is the paper's best-fit "
             "alpha_theta on Prades-le-Lez.  Set 0 to disable."
         ),
@@ -196,20 +223,20 @@ class PondDesign(BaseModel):
     The FDOT volume-area regression and Opti CMAC orifice table were
     calibrated on Florida subdivision detention ponds typically < 2 ha
     and 3-6 ft deep (Harper & Baker 2007).  Larger natural lakes and
-    wetlands should not be modeled as detention ponds — see
+    wetlands should not be modeled as detention ponds, see
     ``max_pond_area_m2`` and ``lake_tags`` below for the classification
     rule.
 
     References:
         FDOT Drainage Design Guide, Chapter 9.
         Opti CMAC Controllable Volume Implementation Guidelines.
-        Richardson et al. 2022, *Scientific Reports* 12:10472 —
+        Richardson et al. 2022, *Scientific Reports* 12:10472, 
             functional definition separating ponds (<=5 ha, <=5 m, <30%
             emergent vegetation) from lakes and wetlands.
         Harper & Baker 2007, *Evaluation of Current Stormwater Design
-            Criteria within the State of Florida*, FDEP final report —
+            Criteria within the State of Florida*, FDEP final report, 
             Florida stormwater-pond calibration envelope (<=2 ha, 3-6 ft).
-        Wetzel 2001, *Limnology: Lake and River Ecosystems* (3rd ed.) —
+        Wetzel 2001, *Limnology: Lake and River Ecosystems* (3rd ed.), 
             limnological pond threshold (~2 ha, <3 m).
     """
 
@@ -301,7 +328,13 @@ class PondDesign(BaseModel):
         default=3.0,
         ge=2.0,
         le=4.0,
-        description="Weir discharge coefficient (rectangular).",
+        description=(
+            "Sharp-crested (transverse) weir discharge coefficient in "
+            "US-customary units (FDOT/Opti-CMAC; ~3.0-3.33).  post_processing "
+            "converts it to the model's flow-unit system before writing the "
+            "INP (x sqrt(0.3048) ~= 1.84 for metric LPS/CMS/MLD), so configure "
+            "it as a US value regardless of the chosen flow_units."
+        ),
     )
     weir_crest_ratio: float = Field(
         default=0.90,
@@ -375,7 +408,7 @@ class PondDesign(BaseModel):
         le=5000.0,
         description=(
             "Euclidean search radius (m) for the geometric drainable-anchor "
-            "rescue in ``finalize_pond_outlets`` — used when a pond's "
+            "rescue in ``finalize_pond_outlets``, used when a pond's "
             "provisional anchor invert is above the pond's max water surface "
             "elevation; without it every pond in a hollow would be a closed "
             "basin.  Larger values allow long culverts but risk creating "
@@ -397,14 +430,14 @@ class PondDesign(BaseModel):
             "recovery rule, FDOT flatwoods practice).  This catches "
             "ponds whose outflow path leads to a dummy OSM-river "
             "terminus that sits only fractions of a meter below the "
-            "pond — head differential too small to drive any sustained "
+            "pond, head differential too small to drive any sustained "
             "gravity flow.  Default 2 m: head differentials below 2 m "
             "would imply <~0.1 % path slope on the typical Florida "
             "subdivision-scale 1-2 km outfall reach, which can't "
             "physically convey pond design release rates.  Terminals "
             "that carry a real receiving-water stage (river_outfall / "
             "water_body_outfall sinks, invert = hydroflattened DEM "
-            "stage) are exempt from this criterion — they instead need "
+            "stage) are exempt from this criterion, they instead need "
             "0.1 m of driving head plus the minimum-slope drop over the "
             "path, since a pond whose max WSE clears the adjacent "
             "canal's water surface drains by gravity regardless of the "
@@ -431,7 +464,7 @@ class PondDesign(BaseModel):
         description=(
             "SWMM ``SurDepth`` applied to gravity-drained (open) pond "
             "storages.  Default 0 keeps gravity-drained ponds strictly "
-            "at ``MaxDepth`` — any overtopping is booked as SWMM flood "
+            "at ``MaxDepth``, any overtopping is booked as SWMM flood "
             "loss so mass balance stays clean.  Setting this > 0 adds a "
             "virtual-surface-pond buffer above MaxDepth (same mechanism "
             "as for closed basins), which reduces pond-overtopping flood "
@@ -443,7 +476,7 @@ class PondDesign(BaseModel):
             "-> 390 M L flood / +13 %; 2 m -> 171 M L flood / +31 %.  "
             "Tune upward only when pond overtopping dominates real flood "
             "volume AND the user accepts higher continuity error.  No "
-            "Green-Ampt seepage is emitted for open ponds — they rely on "
+            "Green-Ampt seepage is emitted for open ponds, they rely on "
             "the gravity outlet, not exfiltration."
         ),
     )
@@ -460,7 +493,7 @@ class PondDesign(BaseModel):
             "Code 930.08; the resulting 0.9 m pond drains in ~3 days, "
             "matching the SFWMD/SJRWMD 72-hour recovery rule (SJRWMD ERP "
             "Applicant's Handbook Vol. II; Harper & Baker 2007).  NRCS raw "
-            "Ksat for these series is 100-250 mm/hr in the A horizon — "
+            "Ksat for these series is 100-250 mm/hr in the A horizon, "
             "we discount to ~10% to account for the spodic Bh layer and "
             "long-term pond clogging."
         ),
@@ -496,7 +529,7 @@ class PondDesign(BaseModel):
             "Per EPA SWMM Applications Manual Example 3 (Rossman 2009) the "
             "downstream end of the inflow pipe is offset above the pond "
             "invert so that for minor storms the pipe has no backwater but "
-            "its crown still sits below the pond's max water surface — "
+            "its crown still sits below the pond's max water surface, "
             "default 0.30 m matches the manual's 1 ft recommendation. "
             "Stacked on top of the slope-preserving offset the rerouter "
             "computes from the original pipe geometry."
@@ -510,7 +543,7 @@ class PondDesign(BaseModel):
             "Crest height (m) of the pond's primary orifice above the pond "
             "invert.  When set to 0, the orifice opening sits exactly at the "
             "pond floor and SWMM's free-flow / submerged-flow regime "
-            "boundary coincides with quiescent depth — tiny depth changes "
+            "boundary coincides with quiescent depth, tiny depth changes "
             "flip the regime each routing step, producing flow-instability "
             "indices > 100 and DYNWAVE non-convergence at every pond.  A "
             "small positive offset (~0.10 m / 4 in) puts the orifice into "
@@ -529,7 +562,7 @@ class PondDesign(BaseModel):
             "Max centroid-to-pond distance (m) for subcatchments rerouted "
             "into an isolated pond by ``reroute_subs_to_isolated_ponds``.  "
             "A pond is 'isolated' if it has zero ``pond_inflow`` edges after "
-            "``route_pipes_into_ponds`` — typically a head-of-network pond "
+            "``route_pipes_into_ponds``, typically a head-of-network pond "
             "whose ds_node has no street-pipe predecessors.  This step "
             "rewires nearby subs' ``Outlet`` directly to the pond storage "
             "(calibrated-reference-model pattern: ``Sub.Outlet = pond_id``) so "
@@ -549,7 +582,7 @@ class PondDesign(BaseModel):
             "absorb via ``reroute_subs_to_isolated_ponds``.  The base cap "
             "is ``pond_volume_m3 / (0.0254 * 0.5)`` (1 inch of runoff at "
             "50 % runoff coefficient) per SJRWMD/SFWMD ERP Applicant's "
-            "Handbook Vol. II §10 — the catchment size that fills the "
+            "Handbook Vol. II §10, the catchment size that fills the "
             "pond's design volume with 1 inch.  Default 2.0x allows the "
             "pond to absorb roughly the runoff from a 5 inch design storm "
             "(close to Florida 10-yr 6-hr Atlas-14, ~5.5 inch).  Higher "
@@ -645,7 +678,7 @@ class HydraulicDesign(BaseModel):
         le=0.3,
         description=(
             "Hydraulic drop (m) applied at each manhole by setting the "
-            "street pipe's SWMM ``OutOffset`` — matches the pattern seen "
+            "street pipe's SWMM ``OutOffset``, matches the pattern seen "
             "in the calibrated UWO sewer reference model where every "
             "street pipe has a small drop (0.01-0.27 m, median ~0.03 m) "
             "at its downstream junction.  Standard sanitary-sewer / "
@@ -667,9 +700,9 @@ class HydraulicDesign(BaseModel):
         description=(
             "Upper bound on pipe slope (m/m) for an outfall conduit "
             "(street / river node -> receiving water / dummy river).  "
-            "If the elevation drop over the initial ``outfall_length`` "
+            "If the elevation drop over the outfall conduit's length "
             "exceeds this slope, the pipe is stretched so that slope = "
-            "max_outfall_slope — conceptually, the outfall moves "
+            "max_outfall_slope, conceptually, the outfall moves "
             "`along the river / water body` to a farther attachment "
             "point where the culvert gradient becomes physically "
             "reasonable.  Default 5 % keeps DYNWAVE convergence clean "
@@ -679,10 +712,10 @@ class HydraulicDesign(BaseModel):
             "up to 10 % for free-flowing culverts, but 5 % is typical "
             "for larger trunk outfalls to avoid supercritical flow and "
             "the high-velocity scour that implies.  Without this "
-            "constraint, dummy-river outfalls created for sub-basins "
-            "with no natural receiving water end up as 5-m pipes "
-            "dropping 5-10 m (100-200 % slope), which destroys "
-            "DYNWAVE convergence on that single link."
+            "constraint, short outfall conduits (especially dummy-river "
+            "outfalls for sub-basins with no natural receiving water) "
+            "dropping several meters become 100-200 % slope links, which "
+            "destroy DYNWAVE convergence on that single link."
         ),
     )
 
@@ -705,7 +738,7 @@ class DualDrainage(BaseModel):
         default=True,
         description=(
             "Enable the dual-drainage overlay.  When False the step is a "
-            "no-op and only the subsurface pipe network is modelled."
+            "no-op and only the subsurface pipe network is modeled."
         ),
     )
     curb_depth_m: float = Field(
@@ -713,7 +746,7 @@ class DualDrainage(BaseModel):
         ge=0.05,
         le=1.0,
         description=(
-            "Effective channel height (m) — sets the invert offset above "
+            "Effective channel height (m), sets the invert offset above "
             "the pipe invert.  Matches typical curb heights (0.15-0.30 m) "
             "plus some overflow allowance so SWMM reports surcharge on the "
             "street rather than catastrophic flooding."
@@ -725,7 +758,7 @@ class DualDrainage(BaseModel):
         le=0.050,
         description=(
             "Manning's n for the surface channel.  0.016 is typical for "
-            "asphalt/concrete gutters; use 0.020+ if modelling rough "
+            "asphalt/concrete gutters; use 0.020+ if modeling rough "
             "pavement or frequent parked vehicles."
         ),
     )
@@ -774,7 +807,7 @@ class TrunkInference(BaseModel):
     """Parameters for synthetic trunk-pipe inference.
 
     OSM-derived pipe networks are typically fragmented (e.g. 26
-    disconnected components on the test catchment — each subdivision is its own
+    disconnected components on the test catchment, each subdivision is its own
     component because OSM doesn't include the trunk drainage that
     physically connects them to the master canal).  This step bridges
     those gaps with synthetic straight-line trunk pipes via a greedy
@@ -818,7 +851,7 @@ class TrunkInference(BaseModel):
         description=(
             "Initial trunk-pipe diameter (m) before ``pipe_by_pipe`` "
             "resizes based on accumulated contributing area.  Default "
-            "0.30 m (12 in) — the standard pipe-by-pipe minimum that "
+            "0.30 m (12 in), the standard pipe-by-pipe minimum that "
             "the design step will grow as needed."
         ),
     )
