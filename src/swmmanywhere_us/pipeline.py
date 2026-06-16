@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from swmmanywhere_us.graph_functions import (
     add_dual_drainage,
@@ -50,8 +50,8 @@ if TYPE_CHECKING:
 
     from swmmanywhere_us.parameters import ParametersDict
 
-GraphType: TypeAlias = "nx.MultiGraph[Any] | nx.MultiDiGraph[Any]"
-GraphFunction: TypeAlias = "Callable[..., nx.MultiGraph[Any] | nx.MultiDiGraph[Any]]"
+type GraphType = "nx.MultiGraph[Any] | nx.MultiDiGraph[Any]"
+type GraphFunction = "Callable[..., nx.MultiGraph[Any] | nx.MultiDiGraph[Any]]"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -382,7 +382,7 @@ _PIPELINE_STEPS: list[Step] = [
     ),
 ]
 
-# Pond-subsystem steps — omitted when ``add_pondsheds`` is False so the
+# Pond-subsystem steps, omitted when ``add_pondsheds`` is False so the
 # pipeline produces a plain dual-drainage stormwater network.
 _POND_STEP_NAMES: frozenset[str] = frozenset(
     {
@@ -398,7 +398,7 @@ _POND_STEP_NAMES: frozenset[str] = frozenset(
 )
 
 
-# Add-on steps stripped in ``bare`` mode — everything beyond core
+# Add-on steps stripped in ``bare`` mode, everything beyond core
 # topology derivation and pipe sizing.  Leaves the bare buried storm-
 # drain network (pipes, junctions, outfalls, subcatchments) for
 # diagnosing flow direction and pipe-sizing in isolation.
@@ -422,7 +422,7 @@ def build_pipeline(add_pondsheds: bool = False, bare: bool = False) -> Pipeline:
             omitted and the pipeline produces a plain dual-drainage
             stormwater network with per-junction subcatchments only.
         bare: When True, strip the pipeline to the bare buried storm-
-            drain network — core topology derivation and pipe sizing
+            drain network, core topology derivation and pipe sizing
             only.  Omits the pond subsystem, trunk inference, manhole
             drops, network simplification, the dual-drainage surface
             network, and the subcatchment coverage pass.  For diagnosing

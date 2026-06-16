@@ -44,7 +44,7 @@ def save_graph(graph: GraphType, fid: Path) -> None:
     )
 
 
-def filter_edges(
+def filter_edges[GraphTypeVar: (nx.Graph[Any], nx.DiGraph[Any], nx.MultiDiGraph[Any])](
     graph: GraphTypeVar,
     keep_types: frozenset[str] = frozenset({"pipe"}),
 ) -> GraphTypeVar:
