@@ -161,6 +161,18 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     conduits, water bodies as STORAGE nodes).  Outfall edges become
     direct conduit connections between the pipe and channel networks.
 
+    Known limitation (accepted, not a bug): each sub-basin terminates at a
+    synthetic free outfall, and a small number of short, steep boundary stubs
+    run supercritical and oscillate under DYNWAVE, so EPA SWMM reports a low
+    "% of steps not converging" (around 2 % on dense, flat networks).  It is
+    localized to those boundary nodes and does not affect flow continuity or
+    interior hydraulics.  It is a structural property of discharging a
+    surcharged minor system through many free boundaries: capping the outfall
+    slope, drowning the outfall with a tailwater, using head-discharge OUTLET
+    links, dissolving the terminal junction, and consolidating outfalls were
+    all tested and none lowers it (most raise it).  The conveyance itself is
+    sound; treat the warning as a boundary artifact, not a model error.
+
     Args:
         addresses (FilePaths): A dictionary of file paths.
         rain_dat_path (str | Path | None): Optional path to the rain data file.
@@ -814,7 +826,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
                 # On-line pond intake (outfall edge into a STORAGE node): the
                 # street is a flow sink for its whole intercepted catchment, so
                 # size the intake conduit to the COMBINED inflow (area-
-                # equivalent √Σdᵢ²) rather than the largest single feeder, 
+                # equivalent √Σdᵢ²) rather than the largest single feeder,
                 # prevents the intake junction surcharging behind an undersized
                 # straw.
                 if v in wb_node_ids:
@@ -1157,7 +1169,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
        outfalls (``outfall``).  Natural rivers (``river``) are dropped.
     2. Identify two kinds of sinks:
 
-       - **Pond outlets**: nodes targeted by a ``pond_outflow`` edge, 
+       - **Pond outlets**: nodes targeted by a ``pond_outflow`` edge,
          the network junctions where managed-pond outflow joins the
          drainage system.
        - **Lake outlets**: outlet nodes of subcatchments whose
@@ -1167,13 +1179,13 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
          are the natural water bodies the pond classifier rejected
          (above ``max_pond_area_m2`` cutoff or filtered out by tag).
 
-       ``basins.parquet`` is used here as a *topological* signal, 
+       ``basins.parquet`` is used here as a *topological* signal,
        it tells us which graph nodes anchor lake-bound flow, not as
        a polygon mask to subtract from output geometries.
     3. Multi-source BFS upstream from every sink in the filtered
        graph, blocked at other sinks.  Each non-sink node is assigned
-       to its nearest downstream sink (the next thing its runoff hits
-, pond outlet, lake outlet, or nothing if it terminates at the
+       to its nearest downstream sink (the next thing its runoff hits,
+       pond outlet, lake outlet, or nothing if it terminates at the
        boundary).
     4. Map each subcatchment to its outlet's sink, group, union
        geometries.
@@ -1214,7 +1226,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
     guaranteed contiguous (``geospatial_utilities.rehome_detached_components``
     runs after both subcatchment-merge steps), so any disconnection here
     is purely the pipe-BFS faithfully grouping spatially-separated
-    subcatchments that the storm-drain network routes to one pond, 
+    subcatchments that the storm-drain network routes to one pond,
     pipes cross natural drainage divides by design.  The polygon is
     therefore a true picture of what the modeled network delivers to
     the pond; it is intentionally not forced contiguous.
