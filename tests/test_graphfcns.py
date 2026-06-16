@@ -12,6 +12,7 @@ from swmmanywhere_us.graph_functions import (
     calculate_weights,
     derive_topology,
     double_directed,
+    enforce_outfall_slope,
     fix_geometries,
     identify_outfalls,
     pipe_by_pipe,
@@ -22,6 +23,7 @@ from swmmanywhere_us.graph_functions import (
     split_long_edges,
     to_undirected,
 )
+from swmmanywhere_us.graph_functions.design import _partial_flow_hydraulics
 from swmmanywhere_us.graph_functions.simplification import (
     _aggregate_subcatchments,
     _consolidate_chain,
@@ -208,15 +210,14 @@ def test_set_chahinian_slope():
 
 
 def test_pipe_by_pipe_no_adverse_slopes():
-    """Pass 5 carving repairs the adverse residue of the max-depth clamp.
+    """Pass 5 carving repairs adverse residue where it is feasible to do so.
 
-    Terrain rises 10 m over the first pipe, so Step C's max_depth clamp
-    leaves the downstream invert above the upstream one (mildly adverse)
-    — Pass 5 must carve the downstream path until every street pipe has
-    a strictly positive invert slope.
+    Terrain rises a modest 1.0 m over the first pipe, so Step C leaves the
+    downstream invert mildly adverse; Pass 5 must carve the downstream path, 
+    within the max_depth budget, until every street pipe is strictly positive.
     """
     G = nx.MultiDiGraph()
-    surfaces = {1: 0.0, 2: 10.0, 3: 10.0, 4: 9.5}
+    surfaces = {1: 0.0, 2: 1.0, 3: 1.0, 4: 0.5}
     for n, se in surfaces.items():
         G.add_node(n, x=float(n) * 100.0, y=0.0, surface_elevation=se, contributing_area=500.0)
     for u, v in [(1, 2), (2, 3), (3, 4)]:
@@ -228,6 +229,71 @@ def test_pipe_by_pipe_no_adverse_slopes():
     for u, v in [(1, 2), (2, 3), (3, 4)]:
         slope = (cf[u] - cf[v]) / 100.0
         assert slope > 0, f"pipe {u}->{v} adverse: slope={slope:.6f}"
+
+
+def test_pipe_by_pipe_respects_max_depth_on_infeasible_terrain():
+    """On terrain too steep for gravity, Pass 5 never excavates past max_depth.
+
+    A 10 m rise over the first pipe cannot be made non-adverse within the 5 m
+    excavation limit (it would need a pump).  The fixed Pass 5 leaves a bounded
+    residual adverse pipe rather than carving an infeasible >5 m burial depth.
+    """
+    hd = HydraulicDesign()
+    G = nx.MultiDiGraph()
+    surfaces = {1: 0.0, 2: 10.0, 3: 10.0, 4: 9.5}
+    for n, se in surfaces.items():
+        G.add_node(n, x=float(n) * 100.0, y=0.0, surface_elevation=se, contributing_area=500.0)
+    for u, v in [(1, 2), (2, 3), (3, 4)]:
+        G.add_edge(u, v, edge_type="pipe", length=100.0, id=f"{u}-{v}")
+
+    result = pipe_by_pipe(G, hydraulic_design=hd)
+
+    cf = nx.get_node_attributes(result, "chamber_floor_elevation")
+    se = nx.get_node_attributes(result, "surface_elevation")
+    # No node is buried deeper than max_depth (the invariant the old carve broke).
+    for n in cf:
+        if n in se:
+            assert se[n] - cf[n] <= hd.max_depth + 1e-6, f"node {n} exceeds max_depth"
+
+
+def test_pond_volume_below():
+    """_volume_below integrates the stage-storage curve up to a partial depth."""
+    from swmmanywhere_us.graph_functions.water_bodies import (
+        _curve_volume,
+        _stage_area_curve,
+        _volume_below,
+    )
+
+    curve = _stage_area_curve(5000.0, 2.0, 30.0, 0.55, 5)
+    total = _curve_volume(curve)
+    assert _volume_below(curve, 0.0) == 0.0
+    assert abs(_volume_below(curve, 2.0) - total) < 1e-6  # full depth == total
+    # Monotonic and strictly between for partial depths (top holds more volume).
+    assert 0 < _volume_below(curve, 1.0) < _volume_below(curve, 1.5) < total
+    # Weir activation ratio at 0.9*Dmax is a sensible fraction (<1).
+    assert 0.5 < _volume_below(curve, 1.8) / total < 1.0
+
+
+def test_partial_flow_hydraulics():
+    """Design-depth partial-flow geometry differs from the R=D/4 full-pipe surrogate."""
+    import math
+
+    diam, slope = 0.5, 0.005
+    r_full = diam / 4.0
+    v_full = (slope**0.5) * r_full ** (2 / 3) / 0.012
+    q_full = v_full * (math.pi * diam**2 / 4)
+
+    # Low flow -> shallow depth: slower and a smaller hydraulic radius than full.
+    fr, _a, r, v = _partial_flow_hydraulics(0.2 * q_full, diam, slope)
+    assert fr < 0.5
+    assert v < v_full
+    assert r < r_full
+
+    # Half-full (theta = pi): hydraulic radius and velocity coincide with full-pipe.
+    fr2, _a2, r2, v2 = _partial_flow_hydraulics(0.5 * q_full, diam, slope)
+    assert abs(fr2 - 0.5) < 0.02
+    assert abs(r2 - r_full) < 1e-3
+    assert abs(v2 - v_full) < 1e-3
 
 
 def test_calculate_weights():
@@ -254,7 +320,7 @@ def test_derive_topology_reattaches_river_anchored_pond_connector():
     The network-side endpoint of a pond_connector can be a river node
     (e.g. a canal-adjacent pond).  River nodes are extracted before the
     street-only shortest-path pass and re-added afterward, so the
-    reattach test must run against the post-re-add graph — testing the
+    reattach test must run against the post-re-add graph, testing the
     pre-re-add survivor set silently drops every river-anchored pond.
     """
     G = nx.MultiDiGraph()
@@ -314,7 +380,7 @@ def test_identify_outfalls_pairs_to_river_centerline():
         G.add_edge(u, v, edge_type="pipe", length=60.0, weight=1.0, geometry=geom)
         G.add_edge(v, u, edge_type="pipe", length=60.0, weight=1.0, geometry=geom.reverse())
 
-    od = OutfallDerivation(river_buffer_distance=30.0, outfall_length=5.0)
+    od = OutfallDerivation(river_buffer_distance=30.0, outfall_clustering_factor=0.0)
     result = identify_outfalls(G, outfall_derivation=od)
 
     sinks = [n for n, d in result.nodes(data=True) if d.get("node_type") == "river_outfall"]
@@ -329,6 +395,116 @@ def test_identify_outfalls_pairs_to_river_centerline():
         u for u, _, d in result.edges(data=True) if d.get("edge_type") == "outfall"
     }
     assert outfall_street_sides <= set(street)
+
+
+def test_identify_outfalls_conduit_length_is_geometric_not_cost():
+    """Retained outfall conduits take the real street->water distance, not the cost.
+
+    Streets sit 20 m from the river centerline, so each river_outfall conduit is
+    ~20 m long whatever the clustering penalty works out to, that penalty is
+    only the MST selection cost (carried on the edge ``weight``).
+    """
+    G = nx.MultiDiGraph()
+    G.graph["crs"] = "EPSG:32617"
+    G.add_node(100, x=0.0, y=0.0)
+    G.add_node(101, x=1000.0, y=0.0)
+    G.add_edge(
+        100,
+        101,
+        edge_type="river",
+        length=1000.0,
+        weight=0.0,
+        geometry=shapely.LineString([(0, 0), (1000, 0)]),
+    )
+    street = {1: (480.0, 20.0), 2: (540.0, 20.0), 3: (600.0, 20.0)}
+    for n, (x, y) in street.items():
+        G.add_node(n, x=x, y=y, surface_elevation=5.0)
+    for u, v in [(1, 2), (2, 3)]:
+        geom = shapely.LineString([street[u], street[v]])
+        G.add_edge(u, v, edge_type="pipe", length=60.0, weight=1.0, geometry=geom)
+        G.add_edge(v, u, edge_type="pipe", length=60.0, weight=1.0, geometry=geom.reverse())
+
+    # factor=2 -> penalty = 2 x median pipe length (60) = 120, unrelated to 20 m.
+    od = OutfallDerivation(river_buffer_distance=30.0, outfall_clustering_factor=2.0)
+    result = identify_outfalls(G, outfall_derivation=od)
+
+    outfall_edges = [
+        (u, v, d) for u, v, d in result.edges(data=True) if d.get("edge_type") == "outfall"
+    ]
+    assert outfall_edges
+    for _, _, d in outfall_edges:
+        assert abs(d["length"] - d["geometry"].length) < 1e-9  # length tracks geometry
+        assert abs(d["length"] - 20.0) < 1.0  # ~20 m to the river, not the cost
+        assert d["weight"] == 120.0  # weight carries the scaled clustering cost
+        assert d["length"] != d["weight"]  # decoupled from the selection cost
+
+
+def test_identify_outfalls_clustering_is_scale_invariant():
+    """Clustering depends on the dimensionless factor, not the absolute pipe length.
+
+    The same factor yields the same outfall count whether junctions are 20 m or
+    200 m apart, because the penalty scales with the network's median pipe length.
+    """
+
+    def n_outfalls(spacing: float, factor: float) -> int:
+        g = nx.MultiDiGraph()
+        g.graph["crs"] = "EPSG:32617"
+        g.add_node(900, x=0.0, y=0.0)
+        g.add_node(901, x=spacing * 6, y=0.0)
+        g.add_edge(
+            900,
+            901,
+            edge_type="river",
+            length=spacing * 6,
+            weight=0.0,
+            geometry=shapely.LineString([(0, 0), (spacing * 6, 0)]),
+        )
+        coords = {i: (spacing * i, 20.0) for i in range(6)}
+        for node, (x, y) in coords.items():
+            g.add_node(node, x=x, y=y, surface_elevation=5.0)
+        for u in range(5):
+            geom = shapely.LineString([coords[u], coords[u + 1]])
+            g.add_edge(u, u + 1, edge_type="pipe", length=spacing, weight=1.0, geometry=geom)
+            g.add_edge(
+                u + 1, u, edge_type="pipe", length=spacing, weight=1.0, geometry=geom.reverse()
+            )
+        od = OutfallDerivation(river_buffer_distance=30.0, outfall_clustering_factor=factor)
+        res = identify_outfalls(g, outfall_derivation=od)
+        return sum(1 for _, _, d in res.edges(data=True) if d.get("edge_type") == "outfall")
+
+    # Same factor -> same outfall count at very different absolute scales.
+    assert n_outfalls(20.0, 0.5) == n_outfalls(200.0, 0.5)
+    assert n_outfalls(20.0, 1.5) == n_outfalls(200.0, 1.5)
+    # A larger factor consolidates more (fewer outfalls) at any given scale.
+    assert n_outfalls(50.0, 1.5) < n_outfalls(50.0, 0.5)
+
+
+def test_enforce_outfall_slope_fixes_adverse_outfall():
+    """An adverse outfall (sink invert >= street invert) is made gravity-feasible.
+
+    The receiving-water sink is lowered just below the street invert so the
+    conduit drains downhill; pond-intake sinks (fixed by pond design) are left
+    untouched.
+    """
+    G = nx.MultiDiGraph()
+    # River outfall: street invert 2 m, sink pinned at the water surface 6 m
+    # (adverse, the water sits above the street).
+    G.add_node(1, chamber_floor_elevation=2.0)
+    G.add_node(900, chamber_floor_elevation=6.0, node_type="river_outfall")
+    G.add_edge(1, 900, edge_type="outfall", length=20.0)
+    # A pond intake that is also adverse, must NOT be touched.
+    G.add_node(2, chamber_floor_elevation=2.0)
+    G.add_node(950, chamber_floor_elevation=6.0, node_type="water_body")
+    G.add_edge(2, 950, edge_type="outfall", pond_intake=True, length=20.0)
+
+    result = enforce_outfall_slope(G, hydraulic_design=HydraulicDesign())
+
+    # River sink lowered to give a small positive slope: 2.0 - 1e-3 * 20 = 1.98.
+    new_sink = result.nodes[900]["chamber_floor_elevation"]
+    assert abs(new_sink - (2.0 - 1e-3 * 20.0)) < 1e-9
+    assert result.nodes[1]["chamber_floor_elevation"] - new_sink > 0  # drains downhill now
+    # Pond storage invert untouched.
+    assert result.nodes[950]["chamber_floor_elevation"] == 6.0
 
 
 def test_identify_outfalls_dummy_fallback_when_river_far():
@@ -352,7 +528,7 @@ def test_identify_outfalls_dummy_fallback_when_river_far():
     G.add_edge(1, 2, edge_type="pipe", length=60.0, weight=1.0, geometry=geom)
     G.add_edge(2, 1, edge_type="pipe", length=60.0, weight=1.0, geometry=geom.reverse())
 
-    od = OutfallDerivation(river_buffer_distance=30.0, outfall_length=5.0)
+    od = OutfallDerivation(river_buffer_distance=30.0, outfall_clustering_factor=0.0)
     result = identify_outfalls(G, outfall_derivation=od)
 
     assert [n for n, d in result.nodes(data=True) if d.get("node_type") == "dummy_river"]
@@ -556,8 +732,9 @@ def test_consolidate_chain():
     merged = pipe_edges[0]
     # Length = 4 * 50 = 200
     assert merged["length"] == 200.0
-    # Diameter = min(0.3, 0.45, 0.6, 0.9) = 0.3
-    assert merged["diameter"] == 0.3
+    # Diameter = max (governing): the merged conduit carries the summed
+    # contributing area, so it inherits the largest (downstream-most) segment.
+    assert merged["diameter"] == 0.9
     # Contributing area = sum
     assert merged["contributing_area"] == 100.0 + 80.0 + 60.0 + 40.0
     # River edge still intact
@@ -684,7 +861,7 @@ def test_reroute_subs_to_isolated_ponds(tmp_path):
     from swmmanywhere_us.parameters import PondDesign
 
     # Two ponds:
-    #   pond A (id=100) is isolated — no pipes terminate at its ds_node (101)
+    #   pond A (id=100) is isolated, no pipes terminate at its ds_node (101)
     #   pond B (id=200) has a pipe feeder via pond_inflow into it
     #
     #     orphan_sub(0,0) ── (nearest pond A) ── pond A storage (10,10)
@@ -692,7 +869,7 @@ def test_reroute_subs_to_isolated_ponds(tmp_path):
     #     pipe_sub(110,10) ── pipe ─→ ds_node B(110,0) ─ pipe_inflow ─→ pond B (120,0)
     G = nx.MultiDiGraph()
     G.graph["crs"] = "EPSG:32617"
-    # Pond A — isolated
+    # Pond A, isolated
     G.add_node(
         100,
         x=10.0,
@@ -707,7 +884,7 @@ def test_reroute_subs_to_isolated_ponds(tmp_path):
     G.add_edge(100, 101, edge_type="orifice")
     G.add_edge(101, 102, edge_type="pond_outflow")
 
-    # Pond B — has pipe inflow (so it is NOT isolated)
+    # Pond B, has pipe inflow (so it is NOT isolated)
     G.add_node(
         200,
         x=120.0,
@@ -726,7 +903,7 @@ def test_reroute_subs_to_isolated_ponds(tmp_path):
 
     # Subs file:
     #   sub 999 is the orphan (outlet 999 not on graph and not in any pondshed)
-    #   sub 203 drains via pond_inflow to pond B — must NOT be rerouted
+    #   sub 203 drains via pond_inflow to pond B, must NOT be rerouted
     G.add_node(999, x=0.0, y=0.0, contributing_area=42.0)  # orphan outlet on graph
     subs = gpd.GeoDataFrame(
         {
@@ -774,7 +951,7 @@ def test_reroute_subs_to_isolated_ponds_capacity_cap(tmp_path):
 
     # One isolated pond with deliberately tiny capacity:
     # wb_volume_m3 = 1 → cap = 2.0 * 1 / (0.0254 * 0.5) = 157 m²
-    # Two candidate orphan subs of 100 m² each — only one fits the cap.
+    # Two candidate orphan subs of 100 m² each, only one fits the cap.
     G = nx.MultiDiGraph()
     G.graph["crs"] = "EPSG:32617"
     G.add_node(
@@ -797,8 +974,8 @@ def test_reroute_subs_to_isolated_ponds_capacity_cap(tmp_path):
         {
             "id": [901, 902],
             "geometry": [
-                shapely.box(0, 0, 10, 10),  # near pond — sub_near
-                shapely.box(10, 15, 20, 25),  # farther — sub_far
+                shapely.box(0, 0, 10, 10),  # near pond, sub_near
+                shapely.box(10, 15, 20, 25),  # farther, sub_far
             ],
             "area": [100.0, 100.0],
         },

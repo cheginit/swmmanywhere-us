@@ -24,7 +24,28 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from swmmanywhere_us.filepaths import FilePaths
-    from swmmanywhere_us.parameters import PondDesign
+    from swmmanywhere_us.parameters import HydraulicDesign, PondDesign
+
+# SWMM flow-unit systems.  The weir discharge coefficient is dimensional
+# (units L^0.5/T), so a US-customary value must be converted to SI when the
+# model runs in metric flow units; the orifice coefficient is dimensionless
+# and needs no conversion.
+_US_FLOW_UNITS = frozenset({"CFS", "GPM", "MGD"})
+# C_SI = C_US * sqrt(0.3048): a US 3.33 sharp-crested transverse weir
+# coefficient maps to the SI 1.84 (e.g. EPA SWMM / Rossman; openSWMM KB
+# "SWMM picks up weir Cd in US units when using SI units").
+_WEIR_CW_US_TO_SI = 0.3048**0.5
+
+
+def _weir_discharge_coeff(weir_cw_us: float, flow_units: str) -> float:
+    """Weir discharge coefficient expressed in the model's flow-unit system.
+
+    ``weir_cw`` is specified in US-customary units (FDOT / Opti-CMAC, see
+    pond_modeling.md S6.7).  SWMM applies the weir coefficient in the active
+    flow units, so for metric systems (LPS/CMS/MLD) the US value is scaled by
+    ``sqrt(0.3048)``; US flow units (CFS/GPM/MGD) use it unchanged.
+    """
+    return weir_cw_us if flow_units in _US_FLOW_UNITS else weir_cw_us * _WEIR_CW_US_TO_SI
 
 
 def _read_rain_dat_file(dat_file: str | Path | None, base_dir: Path) -> tuple[Path, pd.DataFrame]:
@@ -114,7 +135,7 @@ def _drop_small_detached_parts(geom: Any, min_part_m2: float) -> Any:
     ``min_part_m2`` in area; drops the rest.  This trims the trivial slivers a
     pondshed picks up when the storm network pipes a single far subcatchment to
     the pond via a long winding path (a few hundred m² stranded hundreds of m
-    away) — visual noise, not a meaningful split.  Genuine large detached
+    away), visual noise, not a meaningful split.  Genuine large detached
     pieces (distant clusters fed by a trunk) are preserved.  Polygons and
     geometries with one component are returned unchanged.
     """
@@ -131,6 +152,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     rain_dat_unit: Literal["IN", "MM"] = "MM",
     inp_options: dict[str, Any] | None = None,
     pond_design: PondDesign | None = None,
+    hydraulic_design: HydraulicDesign | None = None,
 ):
     """Load synthetic data and write to SWMM input file.
 
@@ -147,6 +169,10 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
         pond_design: Pond-design parameters.  Used to apply closed-basin
             surface-ponding depth + Green-Ampt seepage to ponds that
             ``finalize_pond_outlets`` marked with ``wb_closed_basin=True``.
+        hydraulic_design: Hydraulic-design parameters.  ``max_outfall_slope``
+            is enforced by promoting a clean terminal junction to a direct
+            outfall when its outfall connector would be steeper than that
+            (rather than emitting a degenerate supercritical stub).
     """
     if rain_dat_unit not in ["IN", "MM"]:
         msg = "Invalid rain_dat_unit. Must be 'IN' or 'MM'."
@@ -187,13 +213,13 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     # (< 0.5 m) or NaN, to give shallow-trench pipes a reasonable
     # surcharge buffer rather than zero.
     # NOTE: water-body (STORAGE) nodes have their MaxDepth resolved from
-    # ``wb_max_depth`` in the node loop below — this manhole default is
+    # ``wb_max_depth`` in the node loop below, this manhole default is
     # not applied to ponds.
     raw_depth = nodes.surface_elevation - nodes.chamber_floor_elevation
     max_depth = raw_depth.where(raw_depth >= 0.5, 3.0).fillna(3.0)
 
     # Physical constraint: a manhole MUST be at least as deep as the
-    # largest pipe passing through it — otherwise the pipe's crown sits
+    # largest pipe passing through it, otherwise the pipe's crown sits
     # above ground and water runs out the top at zero surcharge.  Collect
     # the max adjacent pipe diameter (CIRCULAR) or channel depth
     # (RECT_OPEN) per node from the raw edges frame BEFORE it's trimmed.
@@ -280,7 +306,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
         # river centerline; water_body_outfall marks a discharge into a
         # water-body polygon.  All are connected only by an ``outfall`` edge
         # (not a ``river`` edge), so they miss the ``river_node_ids`` set
-        # below and would otherwise land in JUNCTIONS — where SWMM treats
+        # below and would otherwise land in JUNCTIONS, where SWMM treats
         # them as dead-end sinks that pond water up to MaxDepth.  Route all
         # to OUTFALLS directly.  They differ only in invert handling below:
         # dummy_river nodes have no DEM elevation and get an invert derived
@@ -305,17 +331,17 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     terminal_river_ids |= water_body_outfall_ids
     terminal_river_ids |= river_outfall_ids
 
-    # Fix D-1: dummy_river inverts get set by ``set_elevation`` as
-    # ``surface - 3 m`` (manhole default), regardless of how deep the
-    # upstream network pipe actually is.  When the upstream pipe is
-    # shallow-buried (common in flat Florida terrain after pipe_by_pipe),
-    # this produces an outfall invert 4-7 m below the incoming pipe -- a
-    # degenerate drop that the ``enforce_outfall_slope`` step compensates
-    # for by stretching the pipe length 100-200 m.  That's a workaround;
-    # the proper fix is to anchor the dummy-river invert one-pipe-
-    # diameter below its feeding pipe invert (standard receiving-water
-    # drop in storm-drain design).  No new parameter: we use the
-    # incoming outfall edge's own diameter.
+    # Fix D-1: dummy_river sinks are created in identify_outfalls AFTER
+    # set_elevation has run, so they carry no surface_elevation; pipe_by_pipe
+    # then assigns them the sentinel invert ``0 - min_depth`` = -0.5 m
+    # (design.py), regardless of how deep the upstream network pipe actually
+    # is.  When the upstream pipe is shallow-buried (common in flat Florida
+    # terrain), that sentinel produces a degenerate drop into the outfall that
+    # ``enforce_outfall_slope`` otherwise compensates for by stretching the
+    # conduit.  Anchor the dummy-river invert one pipe-diameter below its
+    # feeding pipe invert instead (standard receiving-water drop in storm-drain
+    # design).  No new parameter: we use the incoming outfall edge's own
+    # diameter.
     outfall_edges_to_dummy = edges[
         (edges["edge_type"] == "outfall") & (edges["v"].isin(dummy_river_ids))
     ]
@@ -462,7 +488,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
                 graph_node_data = dict(full_graph.nodes[int(nid)])
             wb_curve = graph_node_data.get("wb_stage_area_curve")
             # The storage's MaxDepth must match the top of its stage-area
-            # curve — SWMM treats depths above the last curve point as
+            # curve, SWMM treats depths above the last curve point as
             # flooded (area capped at the last Y-value), so a MaxDepth
             # greater than the curve's last X would create "phantom"
             # storage in a band with no physical geometry.  Prefer the
@@ -484,7 +510,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
             # up to the pond's overtopping crest (embankment grade just outside
             # the polygon, sampled at insertion).  Conventional detention ponds
             # store water from the invert up to the embankment crest, not just
-            # the FDOT treatment pool — without this the pond floods the instant
+            # the FDOT treatment pool, without this the pond floods the instant
             # it fills the permanent pool.  ``elev`` is the pond invert.  Capped
             # at +2 m of added depth so a high surrounding grade can't
             # extrapolate a small FDOT pond into an unrealistic basin.
@@ -509,7 +535,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
             # could not drain by gravity get
             #   (a) ``SurDepth`` so overtop water stays on the surface as
             #       virtual storage rather than being lost to SWMM's
-            #       flooding-loss term — matches how the calibrated reference
+            #       flooding-loss term, matches how the calibrated reference
             #       model handles every storage (SurDepth = 99 ft), and
             #   (b) Green-Ampt seepage (Psi/Ksat/IMD) so the pond depletes
             #       by percolation through its bottom at a rate
@@ -532,7 +558,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
                     # flooding-loss term during the brief overtopping
                     # window.  The extra head over the orifice also
                     # increases outlet Q ~ sqrt(H), so the pond recovers
-                    # faster once inflow falls.  No seepage tail — these
+                    # faster once inflow falls.  No seepage tail, these
                     # ponds rely on the gravity outlet, not exfiltration.
                     sur_depth = float(pond_design.open_basin_sur_depth_m)
                     psi = ksat = imd = 0.0
@@ -613,7 +639,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
 
     # Precompute the largest pipe diameter at each node, over BOTH
     # endpoints of every pipe edge, so an outfall pipe can match (or
-    # exceed) the biggest pipe at its upstream node — a sudden taper
+    # exceed) the biggest pipe at its upstream node, a sudden taper
     # right before the outfall makes DYNWAVE iterate on the area change.
     # Scanning both endpoints (not just the downstream one) is what
     # catches a synthetic trunk graph-directed *out* of the node: such
@@ -625,7 +651,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     # the pipe's DOWNSTREAM end.  An on-line pond intake (a street paired to a
     # pond by online_pond_intake) is a flow SINK: every pipe in its
     # intercepted catchment drains into it, so the single intake conduit must
-    # pass the COMBINED inflow, not just the largest feeder — otherwise it
+    # pass the COMBINED inflow, not just the largest feeder, otherwise it
     # bottlenecks and the intake junction surcharges.  The area-equivalent
     # diameter √(Σ dᵢ²) sizes the intake to carry the lot.
     _sum_in_d2_at_node: dict[str, float] = {}
@@ -670,7 +696,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
         roughness = getattr(row, "roughness", 0.01)
 
         if edge_type == "orifice":
-            # Orifice link — either a pond primary outlet (SIDE, one-way
+            # Orifice link, either a pond primary outlet (SIDE, one-way
             # flap gate) or a dual-drainage catchbasin grate (BOTTOM, two-
             # way).  Type and flap gate are read from the edge so both
             # kinds emit correctly; pond orifices that set neither fall
@@ -711,19 +737,26 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
             weir_length = (
                 getattr(row, "weir_length_m", 4.6) if hasattr(row, "weir_length_m") else 4.6
             )
-            weir_cd = getattr(row, "weir_cd", 3.0) if hasattr(row, "weir_cd") else 3.0
+            # weir_cd is the US-customary coefficient (PondDesign.weir_cw);
+            # convert to the model's flow-unit system and emit under the key
+            # WeirDefaults.to_inp_row actually reads ("disch_coeff").  The old
+            # "Cd" key was silently ignored, so the configured value never
+            # reached the INP and the dataclass default leaked through instead.
+            weir_cw_us = getattr(row, "weir_cd", 3.0) if hasattr(row, "weir_cd") else 3.0
+            flow_units = (inp_options or {}).get("flow_units", "LPS")
+            weir_cd = _weir_discharge_coeff(weir_cw_us, flow_units)
             weirs_dict[eid] = {
                 "InletNode": u,
                 "OutletNode": v,
                 "WeirType": "TRANSVERSE",
                 "CrestHeight": weir_crest,
-                "Cd": weir_cd,
+                "disch_coeff": weir_cd,
                 # FlapGate=YES on the emergency spillway weir matches the
                 # one-way physical interpretation: water flows OVER the
                 # pond embankment crest from pond to network, never the
                 # other way (gravity prohibits it).  Without FlapGate=YES
                 # SWMM allows reverse flow when the downstream junction
-                # surcharges above the weir crest — same mechanism that
+                # surcharges above the weir crest, same mechanism that
                 # causes orifice backflow on the test catchment.
                 "flap_gate": "YES",
                 "EndCon": 0,
@@ -768,12 +801,12 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
             diam = getattr(row, "diameter", 0.3) if hasattr(row, "diameter") else 0.3
             diam = max(float(diam), 0.15)
             # Fix B: outfall pipes should not taper down from the pipes
-            # at their upstream node — abrupt section changes at the
+            # at their upstream node, abrupt section changes at the
             # outfall point make DYNWAVE iterate on the area mismatch.
             # Bump the outfall to match the largest pipe at its upstream
             # node.  ``_max_pipe_d_at_node`` spans every pipe at the
-            # node — incoming feeders and any trunk graph-directed
-            # outward — so a reverse-flowing trunk can't push its
+            # node, incoming feeders and any trunk graph-directed
+            # outward, so a reverse-flowing trunk can't push its
             # discharge through a 0.3 m straw.  No new parameter.
             if edge_type == "outfall":
                 node_pipe_d = _max_pipe_d_at_node.get(u, 0.0)
@@ -781,7 +814,7 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
                 # On-line pond intake (outfall edge into a STORAGE node): the
                 # street is a flow sink for its whole intercepted catchment, so
                 # size the intake conduit to the COMBINED inflow (area-
-                # equivalent √Σdᵢ²) rather than the largest single feeder —
+                # equivalent √Σdᵢ²) rather than the largest single feeder, 
                 # prevents the intake junction surcharging behind an undersized
                 # straw.
                 if v in wb_node_ids:
@@ -791,21 +824,40 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
             # Clamp Length >= Diameter for every emitted pipe so SWMM
             # doesn't see L/D < 1 -- that ratio corresponds to a pipe
             # fitting / manhole junction, not a conveyance pipe, and it
-            # destabilises DYNWAVE convergence (the pipe alternately
+            # destabilizes DYNWAVE convergence (the pipe alternately
             # surcharges and drains on every routing step).  1.0 m is a
             # final floor so pipes buried in very short graph segments
             # still get a physically meaningful routing length.
             #
-            # Outfall pipes get a tighter L >= 5*D rule.  Outfalls are
-            # at the system boundary and any short-pipe instability
-            # propagates upstream as the dominant Time-Step Critical
-            # Element in DYNWAVE.  L/D = 5 is the standard culvert /
-            # short-pipe stability threshold (Chow's Open-Channel
-            # Hydraulics; matches our merger-conduit sizing).  Adds at
-            # most ~12 m to a 3-m outfall pipe — negligible for the
-            # short stub at the network outflow boundary.
-            l_over_d_min = 5.0 if edge_type == "outfall" else 1.0
-            effective_length = max(length, l_over_d_min * diam, 1.0)
+            # Outfall pipes get a tighter L >= 5*D rule AND an absolute
+            # 5 m floor (matching the merger-conduit sizing below).
+            # Outfalls sit at the system boundary, and any short-pipe
+            # instability there propagates upstream as the dominant
+            # Time-Step Critical Element in DYNWAVE.  L/D = 5 is the
+            # standard culvert / short-pipe stability threshold (Chow's
+            # Open-Channel Hydraulics) -- but L/D alone is not enough:
+            # since lengths are now real street-to-water geometry (not the
+            # old fixed outfall_length), the prevalent D = 0.3 m outfalls
+            # collapse to 5*D = 1.5 m.  A 1.5 m stub running ~18 m/s has a
+            # Courant-stable step of ~0.08 s, far below the routing step,
+            # so it becomes the binding Time-Step Critical Element and
+            # spikes non-convergence.  The 5 m absolute floor keeps
+            # small-D stubs stable while 5*D still scales large outfalls.
+            if edge_type == "outfall":
+                # Outfall stubs get an absolute 5 m floor (plus the 5*D rule),
+                # matching the merger-conduit sizing below.  A capped MAXIMUM
+                # outfall slope was tried (lengthen until slope <=
+                # max_outfall_slope) to tame the short-steep-stub supercritical
+                # oscillation, but a sweep showed it strictly WORSENS DYNWAVE
+                # convergence at every cap value (2.40 % uncapped -> 2.61 % at
+                # 30 % -> 14.8 % at 5 %): lengthening relocates the instability
+                # from the 2 boundary stubs into the interior street network and
+                # amplifies it.  So only the absolute/5*D floors are applied; the
+                # residual stub oscillation is left as a localized boundary
+                # artifact (does not affect interior hydraulics or continuity).
+                effective_length = max(length, 5.0 * diam, 5.0)
+            else:
+                effective_length = max(length, diam, 1.0)
 
             conduits_dict[eid] = {
                 "InletNode": u,
@@ -847,8 +899,8 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     # terminating at each merged outfall, so the merger->outfall stub can
     # carry all of them at once.  A merger junction receives N feeders
     # whose peak flows roughly coincide under a design storm; sizing the
-    # stub to the single largest feeder (the previous behaviour) leaves
-    # it badly undersized whenever several conduits converge — on the test catchment a
+    # stub to the single largest feeder (the previous behavior) leaves
+    # it badly undersized whenever several conduits converge, on the test catchment a
     # 0.9 m stub fed by 5 conduits ran at 26 m/s / 264 % full and became
     # the dominant DYNWAVE time-step-critical element.  Open channels
     # (RECT_OPEN) were also skipped entirely; both shapes are summed here
@@ -928,6 +980,83 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
             "Shape": "CIRCULAR",
             "Geom1": merger_diam,
         }
+
+    # --- Promote degenerate over-steep outfall stubs to direct outfalls ---
+    # A short outfall stub that plunges from a deep terminal junction to a much
+    # shallower free outfall runs SUPERCRITICAL and oscillates under DYNWAVE: it
+    # becomes the dominant Time-Step Critical Element AND its surge inflates
+    # flooding (mass-conserving sloshing, not real conveyance).  When the stub's
+    # upstream node is a CLEAN terminal (its only outlet is this stub, exactly
+    # one inlet) discharging to a pure single-inlet outfall below it, drop the
+    # stub + the redundant outfall and make the terminal junction itself a FREE
+    # outfall.  Direct free discharge (critical depth) drains WITHOUT the
+    # supercritical oscillation and WITHOUT a conduit bottleneck.
+    #
+    # MULTI-INLET terminals are left UNCHANGED: they cannot become outfalls (SWMM
+    # allows one link per outfall), and every other approach was empirically
+    # verified WORSE -- lengthening the stub backs water up; raising the outfall
+    # to a mild slope chokes flow (a low-capacity normal-flow pipe) and INCREASES
+    # flooding; lowering the junction (merger pattern) just relocates the steep
+    # drop onto the short incoming trunks, which then oscillate (convergence
+    # 2.35% -> 4.84%).  The network-to-water drop is irreducible by post-hoc
+    # geometry; the multi-inlet stubs need invert design during graph
+    # construction (pipe_by_pipe), not INP post-processing.
+    max_outfall_slope = (
+        float(hydraulic_design.max_outfall_slope)
+        if hydraulic_design is not None and float(hydraulic_design.max_outfall_slope) > 0
+        else 0.0
+    )
+    if max_outfall_slope > 0:
+        inv_all: dict[str, float] = {}
+        for _d in (junctions_dict, outfalls_dict, storage_dict):
+            for _nid, _nd in _d.items():
+                inv_all[_nid] = float(_nd["InvertElev"])
+        out_deg: dict[str, int] = {}
+        in_deg: dict[str, int] = {}
+        for _ld in (conduits_dict, orifices_dict, weirs_dict):
+            for _l in _ld.values():
+                out_deg[_l["InletNode"]] = out_deg.get(_l["InletNode"], 0) + 1
+                in_deg[_l["OutletNode"]] = in_deg.get(_l["OutletNode"], 0) + 1
+        sub_outlets = set(subs["id"].astype(str))
+        promoted = 0
+        worst_before = 0.0
+        for _cid in list(conduits_dict):
+            _c = conduits_dict[_cid]
+            u, v = _c["InletNode"], _c["OutletNode"]
+            if v not in outfalls_dict or u not in junctions_dict:
+                continue
+            length = float(_c.get("Length", 0) or 0)
+            if length <= 0 or u not in inv_all or v not in inv_all:
+                continue
+            in_off = float(_c.get("InOffset", 0) or 0)
+            out_off = float(_c.get("OutOffset", 0) or 0)
+            slope = ((inv_all[u] + in_off) - (inv_all[v] + out_off)) / length
+            if slope <= max_outfall_slope or (inv_all[u] - inv_all[v]) <= 0:
+                continue
+            clean = out_deg.get(u, 0) == 1 and in_deg.get(u, 0) == 1
+            pure_v = (
+                in_deg.get(v, 0) == 1
+                and out_deg.get(v, 0) == 0
+                and v not in wb_node_ids
+                and v not in outlet_junction_ids
+                and v not in sub_outlets
+            )
+            if not (clean and pure_v):
+                continue
+            worst_before = max(worst_before, slope)
+            del conduits_dict[_cid]
+            xsections_dict.pop(_cid, None)
+            outfalls_dict[u] = {"InvertElev": inv_all[u], "OutfallType": "FREE"}
+            del junctions_dict[u]
+            outfalls_dict.pop(v, None)
+            coordinates_dict.pop(v, None)
+            promoted += 1
+        if promoted:
+            logger.info(
+                f"promote_degenerate_outfalls: promoted {promoted} clean over-steep outfall "
+                f"stub(s) (worst {worst_before * 100:.0f}% slope, > {max_outfall_slope * 100:.0f}% "
+                f"cap) to direct outfalls; multi-inlet over-steep stubs left unchanged."
+            )
 
     # --- Map settings ---
     map_settings = {
@@ -1021,14 +1150,14 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
 
     Algorithm:
 
-    1. Build the filtered drainage network — stormdrain pipes
+    1. Build the filtered drainage network, stormdrain pipes
        (``edge_type="pipe"``), surface dual-drainage channels
        (``street_channel``), pond outlet structures (``orifice``,
        ``weir``), pond outflow connectors (``pond_outflow``) and
        outfalls (``outfall``).  Natural rivers (``river``) are dropped.
     2. Identify two kinds of sinks:
 
-       - **Pond outlets**: nodes targeted by a ``pond_outflow`` edge —
+       - **Pond outlets**: nodes targeted by a ``pond_outflow`` edge, 
          the network junctions where managed-pond outflow joins the
          drainage system.
        - **Lake outlets**: outlet nodes of subcatchments whose
@@ -1038,13 +1167,13 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
          are the natural water bodies the pond classifier rejected
          (above ``max_pond_area_m2`` cutoff or filtered out by tag).
 
-       ``basins.parquet`` is used here as a *topological* signal —
-       it tells us which graph nodes anchor lake-bound flow — not as
+       ``basins.parquet`` is used here as a *topological* signal, 
+       it tells us which graph nodes anchor lake-bound flow, not as
        a polygon mask to subtract from output geometries.
     3. Multi-source BFS upstream from every sink in the filtered
        graph, blocked at other sinks.  Each non-sink node is assigned
        to its nearest downstream sink (the next thing its runoff hits
-       — pond outlet, lake outlet, or nothing if it terminates at the
+, pond outlet, lake outlet, or nothing if it terminates at the
        boundary).
     4. Map each subcatchment to its outlet's sink, group, union
        geometries.
@@ -1064,7 +1193,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
     ponds by spatial Voronoi assignment: each subcatchment in the
     shared catchment is attributed to the pond whose storage centroid
     is nearest to the sub centroid.  This guarantees one pondshed row
-    per ``pond_outflow`` edge in the graph — the function logs a
+    per ``pond_outflow`` edge in the graph, the function logs a
     warning if the produced count diverges from the expected count
     (e.g. a pond whose upstream catchment is empty in the pipe graph).
 
@@ -1080,14 +1209,14 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
     every subcatchment and every rerouted pipe end up consistently
     attributed to the same pond.
 
-    Design invariant — a pondshed may legitimately be a *disconnected*
+    Design invariant, a pondshed may legitimately be a *disconnected*
     MultiPolygon and that is **not** a defect.  Every subcatchment is
     guaranteed contiguous (``geospatial_utilities.rehome_detached_components``
     runs after both subcatchment-merge steps), so any disconnection here
     is purely the pipe-BFS faithfully grouping spatially-separated
-    subcatchments that the storm-drain network routes to one pond —
+    subcatchments that the storm-drain network routes to one pond, 
     pipes cross natural drainage divides by design.  The polygon is
-    therefore a true picture of what the modelled network delivers to
+    therefore a true picture of what the modeled network delivers to
     the pond; it is intentionally not forced contiguous.
     """
     from swmmanywhere_us.graph_functions.water_bodies import partition_pond_network
@@ -1108,7 +1237,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
     # ``pond_sink_mode="storage"``: the pondshed is the catchment that
     # drains *through* the pond (upstream of the storage node), not the
     # over-collected catchment of the pond's downstream junction.  This
-    # is what makes pondsheds spatially coherent — see
+    # is what makes pondsheds spatially coherent, see
     # ``partition_pond_network`` docstring.
     #
     # Drop ``street_channel`` from the partition graph for delineation: the
@@ -1119,7 +1248,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
     # (grate-captured flow → pipes → pond) is each sub's dominant flow route,
     # so the assignment is deterministic and matches where the captured runoff
     # actually goes (the surface channel only carries exceedance overflow).
-    # ``route_pipes_into_ponds`` keeps the full edge set — this override is
+    # ``route_pipes_into_ponds`` keeps the full edge set, this override is
     # delineation-only.
     pondshed_keep = frozenset({"pipe", "orifice", "weir", "pond_inflow", "pond_outflow", "outfall"})
     _pipe_graph, pond_outlets, lake_outlets, node_to_pond = partition_pond_network(
@@ -1196,7 +1325,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
     if len(rows) != n_pond_outflows:
         logger.warning(
             f"generate_pondsheds: produced {len(rows)} pondshed(s) but graph has "
-            f"{n_pond_outflows} pond_outflow edges — {n_pond_outflows - len(rows)} "
+            f"{n_pond_outflows} pond_outflow edges, {n_pond_outflows - len(rows)} "
             "pond(s) have no upstream catchment in the pipe network."
         )
 
@@ -1205,7 +1334,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
     # Clip to the original (unbuffered) AOI: a pondshed is delineated
     # over the buffered processing area, so a pond just outside the AOI
     # can collect spatially-scattered subcatchments through the unified
-    # pipe/trunk network — producing disconnected MultiPolygon
+    # pipe/trunk network, producing disconnected MultiPolygon
     # "pondsheds" whose far-flung parts are buffer-zone artifacts.  We
     # explode each pondshed into its connected polygon components and
     # keep only the components that intersect the AOI; a pond with no
@@ -1219,7 +1348,7 @@ def generate_pondsheds(  # noqa: C901 - per-outlet BFS partition with pond + lak
         )
         pondsheds_gdf = gpd.GeoDataFrame(clipped_rows, crs=target_crs)
         logger.info(
-            f"generate_pondsheds: clipped to AOI — dropped {n_dropped_parts} "
+            f"generate_pondsheds: clipped to AOI, dropped {n_dropped_parts} "
             f"disconnected component(s) and {n_dropped_ponds} pond(s) "
             "entirely outside the original bbox."
         )

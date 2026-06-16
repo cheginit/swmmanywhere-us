@@ -5,8 +5,10 @@ Improved pipe-by-pipe implementation following Duque et al. (2022).
 Correctness improvements over the original:
     1. Slope derived from Manning's equation (paper Eq. 3), not geometry
     2. Diameter monotonicity enforced (downstream >= upstream)
-    3. Depth-dependent max filling ratio (paper Table 1)
-    4. Slope-dependent max velocity (paper Table 1)
+    3. Depth-dependent max filling ratio (paper Table 1), evaluated at the
+       true normal-depth y/D, not the Q/Q_full capacity ratio
+    4. Configurable max velocity (HydraulicDesign.max_v) enforced consistently
+       with the Manning slope bound
     5. Shear stress constraint (tau >= 2 Pa for d >= 0.45m)
 
 Efficiency improvements:
@@ -23,6 +25,7 @@ https://doi.org/10.1016/j.watres.2021.117903
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -47,7 +50,7 @@ MIN_SHEAR = 2.0  # Pa (paper Table 1, constraint 3)
 # Minimum soil cover above a pipe crown (m).  pipe_by_pipe's slope
 # enforcement raises inverts toward the surface on flat terrain; without
 # this floor the crown ends up above grade, leaving no room for the
-# dual-drainage curb channel and destabilising DYNWAVE.  0.5 m clears a
+# dual-drainage curb channel and destabilizing DYNWAVE.  0.5 m clears a
 # standard 0.3 m curb channel with margin.
 _MIN_PIPE_COVER_M = 0.5
 
@@ -80,9 +83,18 @@ def _max_filling_ratio(diam: float) -> float:
     return 0.85
 
 
-def _max_velocity(slope: float) -> float:
-    """Slope-dependent max velocity (paper Table 1, constraints 4-5)."""
-    return 5.0 if slope > 0.0001 else 10.0
+def _max_velocity(hydraulic_design: HydraulicDesign) -> float:
+    """Maximum allowable pipe velocity (m/s).
+
+    Uses the configurable ``HydraulicDesign.max_v`` (default 3.05 m/s). The
+    Manning slope upper bound (``s_max_hydraulic``) caps the full-pipe velocity
+    at this value, but the explicit check applies it at the true partial-flow
+    (normal-depth) velocity, which near capacity exceeds the full-pipe velocity,
+    so the check is intentionally stricter than the slope bound alone. The
+    paper's looser slope-dependent 5/10 m/s limit (Table 1, c4-5) is superseded
+    by this stricter, user-tunable value.
+    """
+    return float(hydraulic_design.max_v)
 
 
 def _slope_from_velocity(v: float, R: float) -> float:
@@ -100,6 +112,52 @@ def _shear_stress(R: float, slope: float) -> float:
     return WATER_DENSITY * GRAVITY * R * slope
 
 
+# Central angle (rad) where partial-flow Manning discharge peaks (~308 deg,
+# Q ~ 1.076 Q_full); the subcritical normal depth is the root below this.
+_PARTIAL_FLOW_Q_PEAK_THETA = 5.3784
+
+
+def _partial_flow_hydraulics(
+    q: float, diam: float, slope: float, mannings_n: float = MANNINGS_N
+) -> tuple[float, float, float, float]:
+    """Normal-depth partial-flow geometry for design flow ``q`` in a circular pipe.
+
+    Solves Manning's Q = (1/n) A(theta) R(theta)^(2/3) sqrt(S) for the central
+    angle theta (subcritical/lower root where Q is monotonic) and returns
+    ``(fill_ratio y/D, flow area A, hydraulic radius R, velocity v = Q/A)`` at
+    that depth, the actual values the pipe runs at, not the full-pipe surrogate
+    (R = D/4).  Flows at or above the partial-flow capacity peak return full-pipe
+    geometry (y/D = 1).
+    """
+    if q <= 0 or diam <= 0 or slope <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    sqrt_s = slope**0.5
+
+    def q_of_theta(theta: float) -> float:
+        area = (diam**2 / 8.0) * (theta - math.sin(theta))
+        rad = (diam / 4.0) * (1.0 - math.sin(theta) / theta)
+        return (1.0 / mannings_n) * area * rad ** (2.0 / 3.0) * sqrt_s
+
+    if q >= q_of_theta(_PARTIAL_FLOW_Q_PEAK_THETA):
+        theta = 2.0 * math.pi  # surcharged -> cap at full-pipe geometry
+    else:
+        lo, hi = 1e-9, _PARTIAL_FLOW_Q_PEAK_THETA
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            if q_of_theta(mid) < q:
+                lo = mid
+            else:
+                hi = mid
+        theta = 0.5 * (lo + hi)
+
+    area = (diam**2 / 8.0) * (theta - math.sin(theta))
+    perim = diam * theta / 2.0
+    rad = area / perim if perim > 0 else 0.0
+    fill_ratio = (1.0 - math.cos(theta / 2.0)) / 2.0
+    velocity = q / area if area > 0 else 0.0
+    return fill_ratio, area, rad, velocity
+
+
 # ---------------------------------------------------------------------------
 # Main algorithm
 # ---------------------------------------------------------------------------
@@ -112,7 +170,7 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
     """Pipe by pipe hydraulic design following Duque et al. (2022).
 
     Two-pass algorithm:
-    1. Cumulative flow accumulation in topological order — O(N)
+    1. Cumulative flow accumulation in topological order, O(N)
     2. For each pipe, scan diameters from smallest feasible and accept
        the first that satisfies all hydraulic constraints.
 
@@ -164,7 +222,7 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
     fallback_count = 0
 
     logger.info(f"Running pipe-by-pipe design ({len(graph)} nodes)")
-    # A node is a "pipe source" if it has no incoming street edge — even if
+    # A node is a "pipe source" if it has no incoming street edge, even if
     # it has pond_connector / river / outfall predecessors.  Without this
     # broadening, a pipe-network node fed only by a pond ends up with no
     # chamber_floor and breaks the us_invert lookup below.
@@ -264,37 +322,54 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
                 if depth_ds < hydraulic_design.min_depth or depth_ds > hydraulic_design.max_depth:
                     continue
 
-                # Actual velocity and filling ratio
-                v = _velocity_from_slope(slope, R)
-                fr = Q / (v * A) if (v * A) > 0 else 0.0
+                # Partial-flow geometry at the design (normal) depth, the
+                # actual velocity, hydraulic radius and filling ratio the pipe
+                # runs at, plus the full-pipe capacity ratio for the
+                # flat-terrain margin:
+                #  - fill_ratio = true y/D, checked against the Table-1 max;
+                #  - v / r_pf = design-depth velocity & hydraulic radius for the
+                #    self-cleansing-velocity and shear checks (not R = D/4);
+                #  - capacity_ratio = Q/Q_full (full-pipe), for the margin.
+                fill_ratio, _a_pf, r_pf, v = _partial_flow_hydraulics(Q, diam, slope)
+                q_full = _velocity_from_slope(slope, R) * A
+                capacity_ratio = Q / q_full if q_full > 0 else 0.0
 
-                # Velocity check (relaxed when depth-constrained)
-                max_v_local = _max_velocity(slope)
-                if not depth_constrained and (v < hydraulic_design.min_v or v > max_v_local):
+                # Velocity check at the design depth (relaxed when depth-constrained).
+                # Skipped for zero-flow pipes (Q == 0, e.g. a fully pervious
+                # headwater): the self-cleansing minimum velocity is meaningless
+                # with no flow, and the partial-flow solver returns v = 0, which
+                # would otherwise reject every diameter and force the fallback.
+                max_v_local = _max_velocity(hydraulic_design)
+                if (
+                    not depth_constrained
+                    and Q > 0
+                    and (v < hydraulic_design.min_v or v > max_v_local)
+                ):
                     continue
 
-                # Filling ratio check
-                if fr > max_fr:
+                # Filling ratio check (true normal-depth y/D vs Table 1, c2)
+                if fill_ratio > max_fr:
                     continue
 
                 # Flat-terrain capacity margin: when the slope is limited by
                 # depth (not hydraulics), Duque's accept-first scan picks the
                 # smallest diameter clearing max_fr -- no margin for peak flows
                 # during dynamic-wave simulation.  Require a configurable
-                # pipe-full-capacity margin (Q_full >= factor * Q) for these
-                # pipes.  See Hesarkazzazi et al. (2022) and Saldarriaga et al.
-                # (2024) on the flat-terrain failure mode of pipe-series
-                # accept-first-feasible sizing.
+                # pipe-full-capacity margin (Q_full >= factor * Q, i.e.
+                # capacity_ratio <= 1/factor) for these pipes.  See Hesarkazzazi
+                # et al. (2022) and Saldarriaga et al. (2024) on the flat-terrain
+                # failure mode of pipe-series accept-first-feasible sizing.
                 if (
                     depth_constrained
                     and hydraulic_design.flat_terrain_capacity_factor > 1.0
-                    and fr > 1.0 / hydraulic_design.flat_terrain_capacity_factor
+                    and capacity_ratio > 1.0 / hydraulic_design.flat_terrain_capacity_factor
                 ):
                     continue
 
-                # Shear stress check (relaxed when depth-constrained)
-                tau = _shear_stress(R, slope)
-                if not depth_constrained and diam >= 0.45 and tau < MIN_SHEAR:
+                # Shear stress at the design depth (relaxed when depth-constrained,
+                # and skipped for zero-flow pipes: no flow, no scour to resist).
+                tau = _shear_stress(r_pf, slope)
+                if not depth_constrained and Q > 0 and diam >= 0.45 and tau < MIN_SHEAR:
                     continue
 
                 # Excavation cost
@@ -304,14 +379,14 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
                 cost = _calculate_cost(max(V, 0), diam)
 
                 v_feas = max(hydraulic_design.min_v - v, 0) + max(v - max_v_local, 0)
-                fr_feas = max(fr - max_fr, 0)
+                fr_feas = max(fill_ratio - max_fr, 0)
 
                 best = {
                     "diameter": diam,
                     "depth": depth_ds,
                     "slope": slope,
                     "velocity": v,
-                    "fr": fr,
+                    "fr": fill_ratio,
                     "tau": tau,
                     "cost_usd": cost,
                     "velocity_feasibility": v_feas,
@@ -325,7 +400,6 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
             if not accepted:
                 fallback_count += 1
                 diam = diameters[-1]
-                a = np.pi * diam**2 / 4
                 r = diam / 4.0
                 s_min = _slope_from_velocity(hydraulic_design.min_v, r)
                 min_slope = hydraulic_design.min_positive_slope
@@ -353,26 +427,25 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
                 # Recompute final slope from actual inverts
                 slope = max((us_invert - invert_ds) / length, min_slope)
 
-                v = _velocity_from_slope(slope, r)
-                fr = Q / (v * a) if (v * a) > 0 else 0.0
-                tau = _shear_stress(r, slope)
+                fill_ratio, _a_pf, r_pf, v = _partial_flow_hydraulics(Q, diam, slope)
+                tau = _shear_stress(r_pf, slope)
                 up_depth = us_elev - us_invert
                 avg_depth = (up_depth + depth_ds) / 2
                 vol = length * (diam + 0.3) * (max(avg_depth, 0) + 0.1)
                 cost = _calculate_cost(max(vol, 0), diam)
 
-                max_v_local = _max_velocity(slope)
+                max_v_local = _max_velocity(hydraulic_design)
                 best = {
                     "diameter": diam,
                     "depth": depth_ds,
                     "slope": slope,
                     "velocity": v,
-                    "fr": fr,
+                    "fr": fill_ratio,
                     "tau": tau,
                     "cost_usd": cost,
                     "velocity_feasibility": max(hydraulic_design.min_v - v, 0)
                     + max(v - max_v_local, 0),
-                    "fr_feasibility": max(fr - _max_filling_ratio(diam), 0),
+                    "fr_feasibility": max(fill_ratio - _max_filling_ratio(diam), 0),
                     "surcharge_feasibility": 0.0,
                 }
 
@@ -475,7 +548,7 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
     # simple "lower ds_cf to required slope, raise only above surface"
     # logic.  Pass 3 produces shallow burials (often < min_depth on
     # flat terrain) but those shallow pipes are what keep DYNWAVE
-    # stable on the broader network — verified empirically that
+    # stable on the broader network, verified empirically that
     # forcing min_depth at the Pass 3 layer regresses routing
     # continuity from -3.8 % to -36 %, even when slope bounds stay
     # fixed.  (A per-pipe velocity-derived bound variant was tested
@@ -503,12 +576,12 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
 
             # Simple slope clamp: lower ds_cf if too high for min_slope,
             # raise (cap at surface - 0.1) if too low for max_slope.
-            # Does NOT enforce min_depth — shallow burials are tolerated
+            # Does NOT enforce min_depth, shallow burials are tolerated
             # to keep network gradients low for SWMM stability.
             required_ds = us_cf - min_slope_global * length
             # Clamp the min-slope deepening to max_depth.  On uphill
             # chains the unclamped lowering spirals the invert 15-20 m
-            # below grade — far past max_depth — producing 300%-slope
+            # below grade, far past max_depth, producing 300%-slope
             # pipes the DYNWAVE solver cannot converge on.  Capping at
             # max_depth accepts a flatter (even mildly adverse) pipe
             # instead, which DYNWAVE handles far better.
@@ -529,19 +602,6 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
     if max_slope_clamps > 0:
         logger.info(f"Pass 3: raised {max_slope_clamps} downstream inverts for max slope")
 
-    # Report nodes exceeding max burial depth as a warning
-    deep_count = 0
-    for node, floor in chamber_floor.items():
-        if node in surface_elevations:
-            depth = surface_elevations[node] - floor
-            if depth > max_depth:
-                deep_count += 1
-    if deep_count > 0:
-        logger.warning(
-            f"{deep_count} nodes exceed max_depth ({max_depth} m) after "
-            f"slope conditioning — terrain requires deeper pipes"
-        )
-
     # --- Pass 4: enforce minimum pipe cover -------------------------------
     # Passes 2-3 raise inverts toward the surface to force positive slopes,
     # which on flat terrain buries pipes shallower than their own diameter
@@ -550,7 +610,7 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
     # diverges.  Deepen any too-shallow node so every connected pipe's crown
     # clears grade by ``_MIN_PIPE_COVER_M``.  Diameter monotonicity means a
     # downstream node is lowered at least as much as its upstream node, so
-    # this only ever adds positive slope — it never creates an adverse pipe.
+    # this only ever adds positive slope, it never creates an adverse pipe.
     node_max_diam: dict[Hashable, float] = {}
     for (pu, pv, _pk), diam in edge_designs["diameter"].items():
         d = float(diam)
@@ -572,11 +632,11 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
 
     # --- Pass 5: zero-adverse profile carving ("breach, don't fill") ------
     # Step C tolerates mildly adverse pipes where its min-slope lowering
-    # would exceed max_depth (the alternative — unclamped lowering — spirals
+    # would exceed max_depth (the alternative, unclamped lowering, spirals
     # inverts on uphill chains).  Gravity sewers must not run uphill
     # (feasibility constraint in sewer-design optimization; adverse reaches
     # require pumps/siphons), so repair the residue here.  This is the
-    # invert analogue of least-cost depression BREACHING vs FILLING
+    # invert analog of least-cost depression BREACHING vs FILLING
     # (Lindsay 2016): walking the designed forest from the outfalls
     # upstream, an adverse pipe first lifts its upstream invert toward the
     # surface (bounded by crown cover, so Pass 4 is not undone); any
@@ -587,7 +647,7 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
     # no new adverse pipe can appear.  The eps target keeps every pipe
     # strictly positive; the full ``min_positive_slope`` ambition stays
     # Step C's job where burial depth affords it (velocity-derived bounds
-    # were tested and break DYNWAVE on flat terrain — see Step C note).
+    # were tested and break DYNWAVE on flat terrain, see Step C note).
     eps_slope = 1e-4
     succ_pipe: dict[Hashable, tuple[Hashable, float]] = {}
     for pu, pv, pd in graph.edges(data=True):
@@ -595,6 +655,8 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
             succ_pipe[pu] = (pv, float(pd["length"]))
     lifted = carved = 0
     max_carve = 0.0
+    residual_count = 0
+    max_residual = 0.0
     for node in reversed(topological_order):
         if node not in chamber_floor or node not in succ_pipe:
             continue
@@ -618,22 +680,61 @@ def pipe_by_pipe(  # noqa: C901, PLR0912, PLR0915
             lifted += 1
         if deficit <= 1e-12:
             continue
-        # Remedy 2: carve the downstream path by the remaining deficit.
-        max_carve = max(max_carve, deficit)
+        # Remedy 2: carve the downstream path by the remaining deficit.  The
+        # carve lowers the whole downstream chain UNIFORMLY (preserving every
+        # already-conditioned slope), so the admissible shift is bounded by the
+        # SHALLOWEST max-depth headroom on that chain, carving further would
+        # excavate past the 5 m limit Step C and Pass 4 respect.  Any deficit
+        # beyond that headroom is left as a bounded residual adverse pipe (the
+        # same mild-adverse tolerance Step C already accepts) rather than
+        # producing an infeasible burial depth.
+        path: list[Hashable] = []
         cur: Hashable | None = ds_node
         on_path: set[Hashable] = set()
         while cur is not None and cur not in on_path:
             on_path.add(cur)
-            if cur in chamber_floor:
-                chamber_floor[cur] -= deficit
+            path.append(cur)
             nxt = succ_pipe.get(cur)
             cur = nxt[0] if nxt is not None else None
-        carved += 1
+        headrooms = [
+            chamber_floor[n] - (surface_elevations[n] - max_depth)
+            for n in path
+            if n in chamber_floor and n in surface_elevations
+        ]
+        applied = min(deficit, max(min(headrooms), 0.0)) if headrooms else deficit
+        if applied > 0:
+            for n in path:
+                if n in chamber_floor:
+                    chamber_floor[n] -= applied
+            max_carve = max(max_carve, applied)
+            carved += 1
+        residual = deficit - applied
+        if residual > 1e-9:
+            residual_count += 1
+            max_residual = max(max_residual, residual)
     if lifted or carved:
         logger.info(
-            f"Pass 5: repaired adverse pipes — lifted {lifted} upstream "
+            f"Pass 5: repaired adverse pipes, lifted {lifted} upstream "
             f"invert(s), carved {carved} downstream path(s) "
             f"(max carve {max_carve:.3f} m)."
+        )
+    if residual_count:
+        logger.warning(
+            f"Pass 5: {residual_count} adverse pipe(s) left with a bounded residual "
+            f"(max {max_residual:.3f} m) to respect the {max_depth} m excavation limit."
+        )
+
+    # Report nodes exceeding max burial depth as a warning (after all invert
+    # conditioning, so it reflects the final design).
+    deep_count = sum(
+        1
+        for node, floor in chamber_floor.items()
+        if node in surface_elevations and surface_elevations[node] - floor > max_depth
+    )
+    if deep_count > 0:
+        logger.warning(
+            f"{deep_count} node(s) exceed max_depth ({max_depth} m) after invert "
+            f"conditioning, terrain requires deeper pipes"
         )
 
     # Refresh the slope design record to match the conditioned inverts.
@@ -657,19 +758,19 @@ def add_manhole_drops(
     **kwargs: Any,
 ) -> nx.MultiDiGraph[Any]:
     """Apply a small hydraulic drop at each manhole by setting street
-    pipes' ``out_offset`` — mirroring the pattern seen in the calibrated
+    pipes' ``out_offset``, mirroring the pattern seen in the calibrated
     UWO Swiss sewer reference (every street pipe has OutOffset
     0.01-0.27 m, median ~0.03 m).
 
     The drop is a standard sanitary / storm-drain design detail
     (ASCE MOP 37 Sec. 5.4): at each manhole the pipe's downstream invert
-    sits ``OutOffset`` metres ABOVE the junction invert, so water exits
+    sits ``OutOffset`` meters ABOVE the junction invert, so water exits
     the pipe and falls into the manhole.  Physically, this:
 
     1. Dissipates flow energy (prevents scour at the inlet to the next
        pipe, and reduces surge propagation).
     2. Gives DYNWAVE a non-zero gradient even at otherwise-flat
-       junctions — improves numerical convergence on flat terrain.
+       junctions, improves numerical convergence on flat terrain.
     3. Accommodates pipe-size mismatches: crowns typically align or
        the larger pipe's crown is higher, producing a drop at the
        spring-line / invert.
@@ -682,9 +783,9 @@ def add_manhole_drops(
     ``out_offset`` edge attribute is added.
 
     Note: this offset supersedes the artificial DEM "inlet depression"
-    dig of Si et al. (2024) — both target the same physical phenomenon
+    dig of Si et al. (2024), both target the same physical phenomenon
     (flow "dropping into" an inlet), but the pipe-level offset is the
-    correct modelling layer because it only affects the hydraulic SWMM
+    correct modeling layer because it only affects the hydraulic SWMM
     model and does not perturb watershed delineation (Callow 2007).
     """
     graph = graph.copy()
@@ -709,7 +810,7 @@ def add_manhole_drops(
         # invert (out_offset is still 0 at this point).
         actual_drop = (float(u_cfe) + in_off) - float(v_cfe)
         if actual_drop <= 0:
-            # Already flat or adverse — don't make it worse.
+            # Already flat or adverse, don't make it worse.
             skipped += 1
             continue
         # Cap at half the hydraulic drop so pipe slope stays at least
@@ -727,23 +828,24 @@ def add_manhole_drops(
     return graph
 
 
-def enforce_outfall_slope(
+def enforce_outfall_slope(  # noqa: C901 - one pass over outfall edges, two feasibility fixes
     graph: nx.MultiDiGraph[Any],
     hydraulic_design: HydraulicDesign,
     **kwargs: Any,
 ) -> nx.MultiDiGraph[Any]:
-    """Stretch over-steep outfall pipes until they meet ``max_outfall_slope``.
+    """Make outfall conduits gravity-feasible: stretch over-steep, fix adverse.
 
     ``identify_outfalls`` picks the nearest river point (or creates a
     dummy-river sentinel) and pairs it to the downstream-most street
-    node; the outfall conduit length is then fixed by
-    ``outfall_derivation.outfall_length`` (often 5 m).  After
-    ``pipe_by_pipe`` sets real inverts, a 5-m outfall that drops 5-10 m
-    becomes a 100-200 % slope pipe — DYNWAVE spends the bulk of its
+    node; the outfall conduit length is the real street-to-receiving-water
+    distance (dummy-river sinks fall back to the clustering penalty,
+    ``outfall_clustering_factor * median pipe length``, as a nominal length).
+    After ``pipe_by_pipe`` sets real inverts, a short outfall that drops
+    5-10 m becomes a 100-200 % slope pipe, DYNWAVE spends the bulk of its
     iterations on that single link and drives overall non-convergence
     to > 50 %.  On the test catchment the specific offender is the dummy-river
     outfall whose upstream node (CFE ~6 m) connects to a dummy at
-    CFE -1 m over 5 m of pipe.
+    CFE -1 m over a few meters of pipe.
 
     Following the user-proposed principle ("outfall location is a
     hint for WHICH water body; actual attachment point can shift"),
@@ -752,23 +854,39 @@ def enforce_outfall_slope(
     ``max_outfall_slope``.  SWMM uses ``length`` for hydraulic routing,
     not geometry, so increasing length is equivalent to having walked
     along the river (or moved the dummy farther out) to a point where
-    a reasonable culvert gradient is physically attainable.  Only
-    ``length`` is changed; invert elevations, diameters, and geometry
-    (for visualization) stay as they were.
+    a reasonable culvert gradient is physically attainable.  For the
+    over-steep case only ``length`` changes.
+
+    The mirror-image problem is the **adverse** outfall: the street is
+    paired (by horizontal distance, elevation-blind) to a receiving water
+    at or above its invert, so the conduit would run uphill.  This arises
+    because ``_set_water_body_outfall_elevations`` pins the sink invert to
+    the water *surface*, which is unphysically high, a real outfall
+    discharges below the waterline.  Here the receiving-water sink invert
+    is lowered just below the street invert so flow drains by gravity (a
+    submerged / free outfall), again keeping the matched water but shifting
+    the attachment depth.  Pond-storage sinks are excluded: their invert is
+    fixed by the pond design and one storage may carry several intakes.
 
     References:
-        FDOT Drainage Design Guide Chapter 6 (Culverts) — 10 % slope
+        FDOT Drainage Design Guide Chapter 6 (Culverts), 10 % slope
             upper bound for free-flowing circular culverts.
-        ASCE Manual 37 §4.2.3 — outfall pipe design criteria.
+        ASCE Manual 37 §4.2.3, outfall pipe design criteria.
     """
     graph = graph.copy()
     max_slope = float(hydraulic_design.max_outfall_slope)
     if max_slope <= 0:
         return graph
 
+    # Minimal positive slope used when restoring an adverse outfall, gentle
+    # enough not to over-bury the sink, steep enough to drain by gravity.
+    feasible_slope = 1e-3
+
     stretched = 0
+    lowered = 0
     worst_before = 0.0
     worst_after = 0.0
+    max_lower = 0.0
     for u, v, _k, d in graph.edges(data=True, keys=True):
         if d.get("edge_type") != "outfall":
             continue
@@ -776,14 +894,23 @@ def enforce_outfall_slope(
         v_cfe = graph.nodes[v].get("chamber_floor_elevation")
         if u_cfe is None or v_cfe is None:
             continue
+        length = float(d.get("length", 0) or 0)
+        if length <= 0:
+            continue
         in_off = float(d.get("in_offset", 0) or 0)
         out_off = float(d.get("out_offset", 0) or 0)
         drop = (float(u_cfe) + in_off) - (float(v_cfe) + out_off)
         if drop <= 0:
-            # Adverse or flat — handled elsewhere, don't touch length.
-            continue
-        length = float(d.get("length", 0) or 0)
-        if length <= 0:
+            # Adverse/flat outfall: lower the receiving-water sink invert just
+            # below the street invert so the conduit drains by gravity.  Pond
+            # storages are excluded (invert fixed by pond design; may carry
+            # several intakes).
+            if d.get("pond_intake"):
+                continue
+            new_v_cfe = (float(u_cfe) + in_off) - out_off - feasible_slope * length
+            graph.nodes[v]["chamber_floor_elevation"] = new_v_cfe
+            lowered += 1
+            max_lower = max(max_lower, float(v_cfe) - new_v_cfe)
             continue
         slope = drop / length
         if slope <= max_slope + 1e-9:
@@ -792,22 +919,25 @@ def enforce_outfall_slope(
         d["length"] = required_length
         # Keep the shapely geometry but set its parametric length to
         # match so downstream consumers (INP writer, visualizations)
-        # see a consistent number.  We do NOT move node coordinates —
+        # see a consistent number.  We do NOT move node coordinates, 
         # the new length is an effective / hydraulic length for the
         # "walked" outfall.
         stretched += 1
         worst_before = max(worst_before, slope)
         new_slope = drop / required_length
         worst_after = max(worst_after, new_slope)
+    msgs = []
     if stretched:
-        logger.info(
-            f"enforce_outfall_slope: stretched {stretched} outfall pipe(s) "
-            f"to meet <= {max_slope * 100:.0f} % slope "
-            f"(worst input slope {worst_before * 100:.0f} % -> "
-            f"{worst_after * 100:.1f} %)."
+        msgs.append(
+            f"stretched {stretched} over-steep pipe(s) "
+            f"(worst {worst_before * 100:.0f} % -> {worst_after * 100:.1f} %)"
         )
+    if lowered:
+        msgs.append(f"lowered {lowered} adverse sink invert(s) (max {max_lower:.2f} m)")
+    if msgs:
+        logger.info(f"enforce_outfall_slope: {'; '.join(msgs)}.")
     else:
-        logger.info("enforce_outfall_slope: all outfall pipes already within slope criterion.")
+        logger.info("enforce_outfall_slope: all outfall conduits already gravity-feasible.")
     return graph
 
 
@@ -833,8 +963,8 @@ def pond_release_capacity_m3s(pond_data: dict[str, Any]) -> float:
         Originally introduced for a "decoupled-subbasin" pondshed-aware
         pipe sizing scheme (FDOT 2026 Drainage Manual Ch. 5; ASCE MOP 77;
         HEC-HMS Reservoir Routing).  The substitution was tested on the
-        flat-terrain test catchment and rolled back — under-sized downstream pipes caused backwater
-        that destabilised the orifice convergence Phase 1 had fixed.
+        flat-terrain test catchment and rolled back, under-sized downstream pipes caused backwater
+        that destabilized the orifice convergence Phase 1 had fixed.
         Helper retained for downstream analysis (e.g. computing
         pond-by-pond design release for visualization or
         post-processing); see :func:`resize_street_pipes_for_pond_routing`.
@@ -867,8 +997,8 @@ def resize_street_pipes_for_pond_routing(  # noqa: C901, PLR0912, PLR0915
     ``pipe_by_pipe`` runs BEFORE ``finalize_pond_outlets`` and sizes street
     pipes assuming each pond drains via its provisional ``pond_connector``
     anchor.  When ``finalize_pond_outlets`` reroutes a pond to a truly
-    downstream node (step 1) — often dropping it 1-3 m below the original
-    anchor — that pond's subcatchment area now flows through a different
+    downstream node (step 1), often dropping it 1-3 m below the original
+    anchor, that pond's subcatchment area now flows through a different
     branch of the network than ``pipe_by_pipe`` accounted for, leaving the
     new branch's street pipes catastrophically undersized.  The
     canonical symptom is a single street junction receiving
@@ -885,17 +1015,17 @@ def resize_street_pipes_for_pond_routing(  # noqa: C901, PLR0912, PLR0915
        smallest standard diameter that can.  Pipe inverts and slopes are
        NOT touched, so the pond outlet decisions made in
        ``finalize_pond_outlets`` (in_offset, conduit inverts) remain
-       valid.  Diameter monotonicity is enforced — once a pipe is
+       valid.  Diameter monotonicity is enforced, once a pipe is
        resized, its successor's minimum diameter is at least as large.
 
     **Note on pondshed-aware sizing**: the FDOT decoupled-subbasin
     pattern (substituting the pond's design release rate for the
     upstream catchment area at each pond outlet) was implemented and
-    tested but rolled back — see :func:`_pond_release_capacity_m3s`
+    tested but rolled back, see :func:`_pond_release_capacity_m3s`
     docstring.  The substitution makes downstream pipes smaller per
     design-storm logic, but the test storms used to verify our generator
     routinely exceed the 10-yr design intensity, so the smaller pipes
-    cause backwater that destabilises the orifice convergence the crest
+    cause backwater that destabilizes the orifice convergence the crest
     offset had fixed.  Until pipe-by-pipe is restructured to size against
     a check-storm intensity, area substitution is left disabled here;
     the helper is retained for downstream analysis tools.
@@ -927,7 +1057,7 @@ def resize_street_pipes_for_pond_routing(  # noqa: C901, PLR0912, PLR0915
     for node in topological_order:
         for ds_node in graph.successors(node):
             edge = graph.get_edge_data(node, ds_node, 0)
-            # Resize both regular pipes and pond_inflow conduits — the
+            # Resize both regular pipes and pond_inflow conduits, the
             # latter are pipes that route_pipes_into_ponds rerouted to
             # terminate at a pond storage instead of the original ds_node,
             # but they remain CIRCULAR conduits that need diameter sizing.
@@ -968,7 +1098,7 @@ def resize_street_pipes_for_pond_routing(  # noqa: C901, PLR0912, PLR0915
                     new_diam = cand
                     break
             else:
-                # No standard diameter handles the design flow — use the
+                # No standard diameter handles the design flow, use the
                 # largest available and let SWMM surcharge.
                 new_diam = diameters[-1]
             if new_diam > float(curr_diam):
@@ -1029,6 +1159,33 @@ def _sample_flow_accumulation(
     return result
 
 
+def _river_flow_accum_areas(graph: nx.MultiDiGraph[Any], addresses: Any) -> dict[Hashable, float]:
+    """Load true watershed area at river nodes from the flow-accumulation raster.
+
+    Returns ``{}`` (so the caller falls back to accumulated impervious area)
+    when no raster is configured or it cannot be sampled, warning loudly if a
+    path is configured but the file is missing.
+    """
+    if addresses is None:
+        return {}
+    flow_accum_path = getattr(getattr(addresses, "model_paths", None), "flow_accumulation", None)
+    if not flow_accum_path:
+        return {}
+    flow_accum_areas = _sample_flow_accumulation(graph, flow_accum_path)
+    if flow_accum_areas:
+        logger.info(
+            f"Using flow accumulation raster for {len(flow_accum_areas)} river nodes "
+            f"(true watershed area)"
+        )
+    elif not Path(flow_accum_path).exists():
+        logger.warning(
+            f"Flow accumulation raster {flow_accum_path} is missing; river channel "
+            f"geometry falls back to accumulated impervious area and channels may be "
+            f"undersized. derive_subcatchments should persist flow_accum.tif."
+        )
+    return flow_accum_areas
+
+
 def _river_drainage_areas(
     graph: nx.MultiDiGraph[Any], addresses: Any
 ) -> tuple[dict[Hashable, float], dict[Hashable, float], set[Any]]:
@@ -1039,18 +1196,7 @@ def _river_drainage_areas(
     Priority 2: impervious contributing area accumulated via pipe
     outfalls, propagated downstream along river edges.
     """
-    flow_accum_areas: dict[Hashable, float] = {}
-    if addresses is not None:
-        flow_accum_path = getattr(
-            getattr(addresses, "model_paths", None), "flow_accumulation", None
-        )
-        if flow_accum_path:
-            flow_accum_areas = _sample_flow_accumulation(graph, flow_accum_path)
-            if flow_accum_areas:
-                logger.info(
-                    f"Using flow accumulation raster for {len(flow_accum_areas)} river nodes "
-                    f"(true watershed area)"
-                )
+    flow_accum_areas = _river_flow_accum_areas(graph, addresses)
 
     contributing_areas = nx.get_node_attributes(graph, "contributing_area")
     river_inflow: dict[Hashable, float] = {}

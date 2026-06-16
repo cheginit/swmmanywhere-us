@@ -9,11 +9,14 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import shapely
+from pyproj import CRS
 
 from swmmanywhere_us import parameters
 from swmmanywhere_us.logging import logger
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from swmmanywhere_us.filepaths import FilePaths
 
 
@@ -49,7 +52,7 @@ def _get_points(
         n: shapely.Point(graph.nodes[n]["x"], graph.nodes[n]["y"]) for n in n_types.get("river", {})
     }
     pipe_points = {
-        n: shapely.Point(graph.nodes[n]["x"], graph.nodes[n]["y"]) for n in n_types["pipe"]
+        n: shapely.Point(graph.nodes[n]["x"], graph.nodes[n]["y"]) for n in n_types.get("pipe", [])
     }
 
     return river_points, pipe_points
@@ -68,7 +71,7 @@ def _load_outfall_water_bodies(
     qualifying polygons are available).
 
     Unlike :func:`water_bodies._load_water_body_polygons`, this does no
-    pond/lake classification — every water body above ``min_area_m2`` is a
+    pond/lake classification, every water body above ``min_area_m2`` is a
     plausible receiving water, and the downstream MST / shortest-path outfall
     selection prunes which are actually used.
     """
@@ -96,6 +99,7 @@ def _pond_intake_pairs(
     addresses: FilePaths,
     target_crs: Any,
     min_area_m2: float = 0.0,
+    footprint_match_m: float = 5.0,
 ) -> list[tuple[Any, Any]]:
     """Match each pond STORAGE node to its basin polygon (for on-line intake).
 
@@ -103,32 +107,96 @@ def _pond_intake_pairs(
     polygon's centroid, so the nearest basin polygon to a storage node is its
     own footprint.  Returns ``[(storage_node_id, polygon), ...]`` for use by
     :func:`_pair_rivers` to pair surrounding pipe nodes to the pond.  Ponds
-    smaller than ``min_area_m2`` are excluded (left off-line).  Empty when
-    there are no pond storages or no basins file.
+    smaller than ``min_area_m2`` are excluded (left off-line).  A storage node
+    is matched only to a basin within ``footprint_match_m`` of it, so a stray
+    storage doesn't grab a distant polygon; those farther are left off-line.
+    Empty when there are no pond storages or no basins file.
     """
-    pond_nodes = [
-        (n, d)
+    if footprint_match_m <= 0:
+        # query_nearest rejects max_distance <= 0; treat it as "no footprint match".
+        return []
+    pond_nodes = {
+        n: (d["x"], d["y"])
         for n, d in graph.nodes(data=True)
         if d.get("node_type") == "water_body" and d.get("wb_area_m2", 0.0) >= min_area_m2
-    ]
+    }
     if not pond_nodes or not addresses.bbox_paths.basins.exists():
         return []
     basins = gpd.read_parquet(addresses.bbox_paths.basins)
     if basins.empty:
         return []
-    if target_crs and basins.crs and str(basins.crs) != str(target_crs):
+    if target_crs and basins.crs and CRS(basins.crs) != CRS(target_crs):
         basins = basins.to_crs(target_crs)
-    geoms = list(basins.geometry)
+    geoms = basins.geometry.to_numpy()
+    node_ids = np.array(list(pond_nodes.keys()), dtype=object)
+    points = shapely.points(list(pond_nodes.values()))
     tree = shapely.STRtree(geoms)
-    pairs: list[tuple[Any, Any]] = []
-    for n, d in pond_nodes:
-        pt = shapely.Point(d["x"], d["y"])
-        poly = geoms[int(tree.nearest(pt))]
-        # Accept only when the storage really sits in/at this basin (a pond's
-        # own footprint), so a stray storage doesn't grab a distant polygon.
-        if poly.distance(pt) <= 5.0:
-            pairs.append((n, poly))
-    return pairs
+    # Nearest basin polygon to each storage point, but only within
+    # ``footprint_match_m`` so a stray storage doesn't grab a distant polygon
+    # (a pond's storage node sits at its own basin's centroid).
+    input_idx, tree_idx = tree.query_nearest(
+        points, max_distance=footprint_match_m, exclusive=True, all_matches=False
+    )
+    return list(zip(node_ids.take(input_idx), geoms.take(tree_idx)))
+
+
+def _prune_uphill_matches(
+    pairings: dict[Any, int],
+    geoms: list[Any],
+    pipe_points: dict[Any, shapely.Point],
+    graph: nx.MultiDiGraph[Any],
+    dem_path: Path,
+    *,
+    to_exterior: bool,
+) -> tuple[dict[Any, int], int]:
+    """Drop street->receiving-water matches that are not gravity-feasible.
+
+    A match is dropped when the receiving water's stage (the DEM sampled at the
+    snapped discharge point) sits ABOVE the street's surface elevation, the
+    street cannot gravity-drain there, and keeping it would force the downstream
+    repairs to sink the outfall invert below the water's true stage, distorting
+    the discharge boundary.  Matching is by horizontal distance only, so this is
+    where elevation feasibility is applied.  Streets dropped here route through
+    the network to a feasible outfall (or fall back to a dummy for a whole
+    component).  Only clearly-uphill matches are removed; ambiguous cases (no
+    surface / nodata) are kept and left to the downstream repairs.
+
+    Returns the kept pairings and the number dropped.
+    """
+    if not pairings:
+        return pairings, 0
+    import rasterio
+
+    streets = list(pairings)
+    snap_coords: list[tuple[float, float]] = []
+    for s in streets:
+        target = geoms[pairings[s]]
+        if to_exterior:
+            # ``.boundary`` (not ``.exterior``) so a MultiPolygon receiving water
+            # works too, ``.exterior`` exists only on a single Polygon.
+            target = target.boundary
+        snap = shapely.shortest_line(pipe_points[s], target).coords[-1]
+        snap_coords.append((snap[0], snap[1]))
+    with rasterio.open(dem_path) as src:
+        nodata = src.nodata
+        stages = [float(v[0]) for v in src.sample(snap_coords)]
+
+    kept: dict[Any, int] = {}
+    pruned = 0
+    for s, stage in zip(streets, stages):
+        surf = graph.nodes[s].get("surface_elevation")
+        # Keep when unjudgeable (no surface / nodata stage) or the water is at or
+        # below the street surface; drop only clearly-uphill matches.
+        if (
+            surf is None
+            or np.isnan(stage)
+            or (nodata is not None and stage == nodata)
+            or stage <= float(surf)
+        ):
+            kept[s] = pairings[s]
+        else:
+            pruned += 1
+    return kept, pruned
 
 
 def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairing with per-subgraph fallback ladder is one pass
@@ -136,10 +204,11 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
     river_points: dict[Any, shapely.Point],
     pipe_points: dict[Any, shapely.Point],
     river_buffer_distance: float,
-    outfall_length: float,
+    clustering_cost: float,
     water_body_polys: list[Any] | None = None,
     pond_intake_pairs: list[tuple[Any, Any]] | None = None,
     pond_intake_buffer: float = 30.0,
+    dem_path: Path | None = None,
 ) -> nx.MultiDiGraph[Any]:
     """Pair river and street nodes.
 
@@ -147,7 +216,7 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
     are paired to a synthetic ``river_outfall`` sink snapped onto that
     centerline.  Distance is measured to the river edge geometry, not to
     river graph nodes: river features are noded only at their endpoints
-    (often hundreds of metres apart), so point-to-node pairing misses most
+    (often hundreds of meters apart), so point-to-node pairing misses most
     streets that actually border the water.  When ``water_body_polys`` is
     supplied, street nodes within the same buffer of a water-body polygon
     are likewise paired to a synthetic ``water_body_outfall`` sink on the
@@ -162,7 +231,10 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
         pipe_points: A dictionary of street points.
         river_buffer_distance: The distance within which a river and
             street node can be paired.
-        outfall_length: The length of the outfall.
+        clustering_cost: MST selection penalty stamped on each candidate
+            street->outfall link (the ``weight`` the MST selects on).  The
+            retained conduit's ``length`` is its real geometric distance, set
+            later; this value is not a length.
         water_body_polys: Optional water-body polygon geometries to treat as
             outfall candidates alongside rivers.
 
@@ -199,47 +271,67 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
     existing_ints = [n for n in graph.nodes if isinstance(n, int)]
     next_dummy_id = (max(existing_ints) + 1) if existing_ints else 0
 
-    # Insert a dummy river node and use lowest elevation node as outfall
-    # for each subgraph with no matched outfalls
+    # Match every street node to its nearest river centerline and/or
+    # water-body shoreline within the buffer, in one vectorized pass each.
+    # The nearest match is purely geometric (independent of graph component),
+    # so this is hoisted out of the per-component loop.  ``query_nearest`` with
+    # ``all_matches=False`` returns one (input_idx, tree_idx) pair per matched
+    # input ordered by input index, equivalent to the old per-node
+    # ``query_nearest(pt)[0]`` but without the Python-level loop.
+    if pipe_points:
+        pipe_ids = list(pipe_points)
+        pipe_pts = np.array([pipe_points[n] for n in pipe_ids], dtype=object)
+        if river_tree is not None:
+            hit = river_tree.query_nearest(
+                pipe_pts, max_distance=river_buffer_distance, all_matches=False
+            )
+            river_pairings = {pipe_ids[i]: int(j) for i, j in zip(hit[0].tolist(), hit[1].tolist())}
+        if wb_tree is not None:
+            hit = wb_tree.query_nearest(
+                pipe_pts, max_distance=river_buffer_distance, all_matches=False
+            )
+            wb_pairings = {pipe_ids[i]: int(j) for i, j in zip(hit[0].tolist(), hit[1].tolist())}
+
+    # Gravity-feasibility filter: drop matches where the receiving water sits
+    # above the street (the DEM stage at the snapped discharge point exceeds the
+    # street surface), since the street cannot gravity-drain there.  This runs
+    # BEFORE the dummy fallback below, so a component whose only matches were
+    # uphill correctly falls back to a dummy outfall.
+    pruned_r = pruned_w = 0
+    if dem_path is not None:
+        if river_tree is not None and river_pairings:
+            river_pairings, pruned_r = _prune_uphill_matches(
+                river_pairings, river_lines, pipe_points, graph, dem_path, to_exterior=False
+            )
+        if wb_tree is not None and wb_pairings:
+            wb_pairings, pruned_w = _prune_uphill_matches(
+                wb_pairings, wb_geoms, pipe_points, graph, dem_path, to_exterior=True
+            )
+        if pruned_r or pruned_w:
+            logger.info(
+                f"gravity-feasible outfalls: dropped {pruned_r} river + {pruned_w} water-body "
+                f"match(es) where the receiving water sits above the street; those streets "
+                f"route through the network (or a dummy) instead of discharging uphill."
+            )
+
+    # Insert a dummy river node (lowest-elevation street node as the outfall)
+    # for each weakly connected component that has street nodes but no matched
+    # river/water-body outfall.
     subgraphs = []
     for component in nx.weakly_connected_components(graph):
         sg = graph.subgraph(component).copy()
         subgraphs.append(sg)
 
-        # Pair up the river and street nodes for each subgraph
-        pipe_points_ = {k: v for k, v in pipe_points.items() if k in sg.nodes}
-
-        # Subgraphs without any street nodes (rivers and/or pond_connector-
-        # only components) don't need outfall pairing — rivers drain via
-        # their inherent direction and pond connectors are rewired later
-        # by finalize_pond_outlets.
-        if not pipe_points_:
+        comp_pipe_nodes = [n for n in component if n in pipe_points]
+        # Components without street nodes (rivers and/or pond_connector-only
+        # components) don't need outfall pairing, rivers drain via their
+        # inherent direction and pond connectors are rewired later by
+        # finalize_pond_outlets.
+        if not comp_pipe_nodes:
             continue
 
-        # Pair street nodes to nearby rivers using the centerline geometry:
-        # each street node within river_buffer_distance of a river edge is
-        # matched to that edge (the nearest one if several are in range).
-        subgraph_rivers: dict[Any, int] = {}
-        if river_tree is not None:
-            for node, pt in pipe_points_.items():
-                hits = river_tree.query_nearest(pt, max_distance=river_buffer_distance)
-                if len(hits):
-                    subgraph_rivers[node] = int(hits[0])
-
-        # Pair street nodes to nearby water bodies using the polygon geometry:
-        # each street node within river_buffer_distance of a polygon shoreline
-        # is matched to that polygon (the nearest one if several are in range).
-        subgraph_wb: dict[Any, int] = {}
-        if wb_tree is not None:
-            for node, pt in pipe_points_.items():
-                hits = wb_tree.query_nearest(pt, max_distance=river_buffer_distance)
-                if len(hits):
-                    subgraph_wb[node] = int(hits[0])
-
-        # Check if there are any matched outfalls (river or water body)
-        if subgraph_rivers or subgraph_wb:
-            river_pairings.update(subgraph_rivers)
-            wb_pairings.update(subgraph_wb)
+        # This component already discharges to a real river/water body.
+        if any(n in river_pairings or n in wb_pairings for n in comp_pipe_nodes):
             continue
 
         # In cases of e.g., an area with no rivers/water bodies to discharge
@@ -281,14 +373,16 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
 
     # Add edges between the dummy river sinks and their street nodes
     for street_id, river_id in matched_outfalls.items():
-        # The fixed weight is intentional: it acts as the MST clustering
-        # radius for outfall selection — distance-based weights were tested
-        # and degrade outfall placement.
+        # ``weight`` is the constant clustering cost the MST selects on, 
+        # distance-based weights were tested and degrade outfall placement.
+        # The dummy sink is a fabricated point (arbitrary location), so the
+        # conduit has no real geometric length; the clustering cost doubles as
+        # its nominal length (real distances are used for genuine outfalls).
         graph.add_edge(
             street_id,
             river_id,
-            length=outfall_length,
-            weight=outfall_length,
+            length=clustering_cost,
+            weight=clustering_cost,
             edge_type="outfall",
             geometry=shapely.LineString([pipe_points[street_id], river_points[river_id]]),
             id=f"{street_id}-{river_id}-outfall",
@@ -298,8 +392,8 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
     # placed at the point on the river centerline nearest that street, then
     # connect the two with an ``outfall`` edge.  Snapping onto the centerline
     # (rather than wiring to a river graph node) keeps the discharge at the
-    # closest point on the receiving water — river nodes exist only at
-    # feature endpoints, often hundreds of metres away — and gives the sink
+    # closest point on the receiving water, river nodes exist only at
+    # feature endpoints, often hundreds of meters away, and gives the sink
     # a location where ``identify_outfalls`` can sample the receiving
     # water's surface elevation from the (hydroflattened) DEM.  These
     # ``river_outfall`` sinks are structurally identical to the dummy-river
@@ -315,8 +409,10 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
         graph.add_edge(
             street_id,
             sink_id,
-            length=outfall_length,
-            weight=outfall_length,
+            # Real conduit distance to the snapped river point; ``weight`` is the
+            # constant clustering cost the MST selects on (see _connect_mst_outfalls).
+            length=line.length,
+            weight=clustering_cost,
             edge_type="outfall",
             geometry=shapely.LineString([street_pt, snap_pt]),
             id=f"{street_id}-{sink_id}-outfall",
@@ -341,8 +437,10 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
         graph.add_edge(
             street_id,
             sink_id,
-            length=outfall_length,
-            weight=outfall_length,
+            # Real conduit distance to the snapped shoreline point; ``weight`` is
+            # the constant clustering cost the MST selects on.
+            length=line.length,
+            weight=clustering_cost,
             edge_type="outfall",
             geometry=shapely.LineString([street_pt, shore_pt]),
             id=f"{street_id}-{sink_id}-outfall",
@@ -352,7 +450,7 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
     # pond's STORAGE node with an ``outfall`` edge, so derive_topology treats
     # the pipe node as a drain point and routes the surrounding catchment into
     # the pond (which discharges via finalize_pond_outlets).  Constraints:
-    #   * pond precedence is yielded to rivers — a node already paired to a
+    #   * pond precedence is yielded to rivers, a node already paired to a
     #     river/dummy outfall is skipped, so no junction ends up with two
     #     competing downstream conduits;
     #   * only nodes in the SAME connected component as the pond storage are
@@ -367,29 +465,46 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
         pond_storage_ids = [sid for sid, _ in pond_intake_pairs]
         pond_tree = shapely.STRtree(pond_geoms)
         n_intakes = 0
-        for node, pt in pipe_points.items():
-            if node not in graph.nodes or node in matched_outfalls or node in river_pairings:
-                continue
-            if graph.nodes[node].get("node_type") in {"water_body", "water_body_outfall"}:
-                continue
-            hits = pond_tree.query_nearest(pt, max_distance=pond_intake_buffer)
-            if not len(hits):
-                continue
-            storage_id = pond_storage_ids[int(hits[0])]
-            if node == storage_id or component_of.get(node) != component_of.get(storage_id):
-                continue
-            storage_pt = shapely.Point(graph.nodes[storage_id]["x"], graph.nodes[storage_id]["y"])
-            graph.add_edge(
-                node,
-                storage_id,
-                length=outfall_length,
-                weight=outfall_length,
-                edge_type="outfall",
-                pond_intake=True,
-                geometry=shapely.LineString([pt, storage_pt]),
-                id=f"{node}-{storage_id}-pondintake",
+        # Eligible pipe nodes: in the graph, not already paired to a river or
+        # dummy outfall, and not water-body STORAGE/outfall nodes themselves.
+        # (Nodes paired to a water-body outfall remain eligible, matching the
+        # original.)  Their nearest pond within the buffer is found in one
+        # vectorized pass; the per-node component/self checks stay in the loop.
+        candidates = [
+            node
+            for node in pipe_points
+            if node in graph.nodes
+            and node not in matched_outfalls
+            and node not in river_pairings
+            and graph.nodes[node].get("node_type") not in {"water_body", "water_body_outfall"}
+        ]
+        if candidates and pond_intake_buffer > 0:
+            cand_pts = np.array([pipe_points[n] for n in candidates], dtype=object)
+            hit = pond_tree.query_nearest(
+                cand_pts, max_distance=pond_intake_buffer, all_matches=False
             )
-            n_intakes += 1
+            for ci_idx, pond_idx in zip(hit[0].tolist(), hit[1].tolist()):
+                node = candidates[ci_idx]
+                storage_id = pond_storage_ids[pond_idx]
+                if node == storage_id or component_of.get(node) != component_of.get(storage_id):
+                    continue
+                pt = pipe_points[node]
+                storage_pt = shapely.Point(
+                    graph.nodes[storage_id]["x"], graph.nodes[storage_id]["y"]
+                )
+                graph.add_edge(
+                    node,
+                    storage_id,
+                    # Real conduit distance from the pipe node to the pond storage;
+                    # ``weight`` is the constant clustering cost the MST selects on.
+                    length=pt.distance(storage_pt),
+                    weight=clustering_cost,
+                    edge_type="outfall",
+                    pond_intake=True,
+                    geometry=shapely.LineString([pt, storage_pt]),
+                    id=f"{node}-{storage_id}-pondintake",
+                )
+                n_intakes += 1
         logger.info(f"online_pond_intake: added {n_intakes} pond intake edge(s).")
 
     return graph
@@ -453,7 +568,18 @@ def _connect_mst_outfalls(
     # makes sense here over shortest path as each node is only allowed to
     # be visited once - thus encouraging fewer outfalls. In shortest path
     # nodes near rivers will always just pick their nearest river node.
-    T = nx.minimum_spanning_tree(paired_G.to_undirected(), weight="length")
+    #
+    # Select on ``mst_cost``: the constant clustering ``weight`` for outfall
+    # links (so draining directly is a fixed penalty, never the real distance, 
+    # distance-based selection degrades placement) and the geometric ``length``
+    # for everything else (pipes, plus the zeroed river/waste edges).  Outfall
+    # ``length`` now carries the real conduit distance, so it must not drive
+    # selection; the default of 1 for a missing ``length`` mirrors networkx's
+    # own ``weight="length"`` fallback, keeping selection identical.
+    undirected = paired_G.to_undirected()
+    for _, _, d in undirected.edges(data=True):
+        d["mst_cost"] = d["weight"] if d.get("edge_type") == "outfall" else d.get("length", 1)
+    T = nx.minimum_spanning_tree(undirected, weight="mst_cost")
 
     # Retain the shortest path outfalls in the original graph
     for u, v, d in T.edges(data=True):
@@ -478,44 +604,46 @@ def _connect_mst_outfalls(
 
 
 def _flag_iqr_outlier_outfalls(graph: nx.MultiDiGraph[Any]) -> list[Any]:
-    """Flag outfall street nodes whose elevation is an IQR outlier.
+    """Diagnostic: flag outfall street nodes whose elevation is an IQR outlier.
 
     After outfall pairing, compute the interquartile range of street-side
     outfall node elevations and flag any that exceed Q3 + 1.5*IQR as
-    outliers.  These are typically "fake" outfalls created in flat
-    sub-basins that cannot actually drain to the flagged elevation.
+    outliers, typically high-elevation dummy outfalls in flat sub-basins
+    that are unlikely to drain realistically to the flagged elevation.
 
-    Returns a list of outlier street node IDs (for logging).  The filter
-    is applied per weakly connected component so that topographically
-    distinct drainage basins are not compared against each other.
+    This is DIAGNOSTIC ONLY: the returned IDs are logged as a warning so a
+    user can inspect them; the function does not remove, re-route, or
+    re-weight any outfall.  The IQR is taken per weakly connected component
+    so topographically distinct basins are not compared against each other.
     """
+    # Map each node to its weakly-connected-component index once, then make a
+    # single pass over outfall edges grouping street-side elevations by
+    # component, O(V + E) instead of re-scanning every edge once per component.
+    # (weakly_connected_components ignores edge direction internally.)
+    node_wcc: dict[Any, int] = {}
+    for i, wcc in enumerate(nx.weakly_connected_components(graph)):
+        for n in wcc:
+            node_wcc[n] = i
+
+    elevations_by_wcc: dict[int, list[tuple[Any, float]]] = {}
+    for u, _v, d in graph.edges(data=True):
+        if d.get("edge_type") != "outfall":
+            continue
+        node_data = graph.nodes[u]
+        if "surface_elevation" not in node_data:
+            continue
+        elevations_by_wcc.setdefault(node_wcc[u], []).append(
+            (u, float(node_data["surface_elevation"]))
+        )
+
     outliers: list[Any] = []
-
-    # Group outfall edges by weakly connected component
-    # (pass the directed graph directly; weakly_connected_components
-    #  computes WCCs by ignoring edge direction internally)
-    wccs = list(nx.weakly_connected_components(graph))
-    for wcc in wccs:
-        outfall_street_nodes = []
-        for u, _v, d in graph.edges(data=True):
-            if d.get("edge_type") != "outfall":
-                continue
-            if u not in wcc:
-                continue
-            if "surface_elevation" not in graph.nodes[u]:
-                continue
-            outfall_street_nodes.append((u, float(graph.nodes[u]["surface_elevation"])))
-
-        if len(outfall_street_nodes) < 4:
+    for samples in elevations_by_wcc.values():
+        if len(samples) < 4:
             continue  # IQR needs at least 4 samples to be meaningful
-
-        elevations = np.array([e for _, e in outfall_street_nodes])
+        elevations = np.array([e for _, e in samples])
         q1, q3 = np.percentile(elevations, [25, 75])
-        iqr = q3 - q1
-        upper_bound = q3 + 1.5 * iqr
-        for node, elev in outfall_street_nodes:
-            if elev > upper_bound:
-                outliers.append(node)
+        upper_bound = q3 + 1.5 * (q3 - q1)
+        outliers.extend(node for node, elev in samples if elev > upper_bound)
 
     return outliers
 
@@ -526,8 +654,8 @@ def _set_water_body_outfall_elevations(graph: nx.MultiDiGraph[Any], addresses: F
     River and water-body outfall sinks are created in :func:`_pair_rivers`
     after ``set_elevation`` has already run, so they carry no
     ``surface_elevation``.  Left unset, ``pipe_by_pipe`` falls back to
-    ``0 - min_depth`` for them — a deep sentinel invert that produces a
-    multi-metre drop over the short outfall conduit, which
+    ``0 - min_depth`` for them, a deep sentinel invert that produces a
+    multi-meter drop over the short outfall conduit, which
     ``enforce_outfall_slope`` then "fixes" by stretching the conduit
     50-150 m.  Sampling the (hydroflattened) DEM at the snapped sink gives
     the receiving water's surface elevation, so the outfall sits at a
@@ -644,15 +772,18 @@ def identify_outfalls(
     polygons are also treated as outfall candidates (paired by polygon
     geometry). If there are no plausible outfalls for an entire subgraph, then
     a dummy river node is created and the lowest elevation node is paired with
-    it. Any street->river/outfall link is given a `weight` and `length` of
-    outfall_derivation.outfall_length, this is to ensure some penalty on the
-    total number of outfalls selected.
+    it. Each candidate street->river/outfall link carries a constant selection
+    ``weight`` of ``outfall_derivation.outfall_clustering_factor * median pipe
+    length`` to penalize the total number of outfalls.
 
     The retained outfalls are those selected by the minimum spanning tree
-    (MST) of the combined street-river graph: rivers and the waste root
-    fuse at zero cost, so ``outfall_length`` acts as a clustering radius —
-    one outfall survives per street cluster connected by edges shorter
-    than it.
+    (MST) of the combined street-river graph: rivers and the waste root fuse
+    at zero cost, so the clustering penalty acts as a clustering radius, one
+    outfall survives per street cluster connected by pipes shorter than it.
+    Scaling that penalty to the median pipe length makes outfall density
+    scale-invariant across dense and sparse networks.  The MST selects on this
+    cost (the edge ``weight``); each retained outfall conduit's ``length`` is
+    then its real street-to-receiving-water distance, decoupled from the cost.
 
     Args:
         graph: A directed multi-graph.
@@ -668,6 +799,28 @@ def identify_outfalls(
 
     river_points, pipe_points = _get_points(graph)
 
+    # Scale the MST clustering penalty to the network.  The penalty competes
+    # against inter-junction pipe lengths in the MST, so expressing it as
+    # ``factor * median(pipe length)`` makes outfall density scale-invariant:
+    # one factor consolidates consistently on dense and sparse networks,
+    # whereas an absolute distance over- or under-clusters as spacing changes.
+    pipe_lengths = [
+        d["length"]
+        for _, _, d in graph.edges(data=True)
+        if d.get("edge_type") == "pipe" and "length" in d
+    ]
+    median_pipe_length = float(np.median(pipe_lengths)) if pipe_lengths else 0.0
+    clustering_cost = outfall_derivation.outfall_clustering_factor * median_pipe_length
+    if not pipe_lengths and outfall_derivation.outfall_clustering_factor > 0:
+        logger.warning(
+            "Outfall clustering: no pipe edges with a length found, so the MST penalty "
+            "is 0 and consolidation is disabled, every candidate outfall survives."
+        )
+    logger.info(
+        f"Outfall clustering penalty: {outfall_derivation.outfall_clustering_factor} x "
+        f"median pipe length {median_pipe_length:.1f} = {clustering_cost:.1f}."
+    )
+
     water_body_polys = _outfall_water_body_polys(graph, outfall_derivation, addresses)
 
     # On-line pond intakes: match each pond STORAGE node to its basin polygon
@@ -680,6 +833,7 @@ def identify_outfalls(
             addresses,
             graph.graph.get("crs"),
             min_area_m2=outfall_derivation.pond_intake_min_area_m2,
+            footprint_match_m=outfall_derivation.pond_footprint_match_m,
         )
         if pond_intake_pairs:
             logger.info(
@@ -692,15 +846,16 @@ def identify_outfalls(
         river_points,
         pipe_points,
         outfall_derivation.river_buffer_distance,
-        outfall_derivation.outfall_length,
+        clustering_cost,
         water_body_polys=water_body_polys,
         pond_intake_pairs=pond_intake_pairs,
         pond_intake_buffer=outfall_derivation.pond_intake_buffer_m,
+        dem_path=(addresses.bbox_paths.elevation if addresses is not None else None),
     )
 
     # Give river/water-body outfall sinks the receiving water's surface
     # elevation from the DEM (they're created after set_elevation, so
-    # otherwise carry none — see _set_water_body_outfall_elevations).
+    # otherwise carry none, see _set_water_body_outfall_elevations).
     if addresses is not None:
         _set_water_body_outfall_elevations(graph_, addresses)
 

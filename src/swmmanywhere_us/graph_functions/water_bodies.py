@@ -24,6 +24,7 @@ runoff directly to ponds (matching the calibrated reference-model pattern):
 from __future__ import annotations
 
 import collections
+import itertools
 import math
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -119,7 +120,7 @@ def _solve_max_depth(
 
     Returns the mid depth that produced the best trapezoidal-integrated
     volume match.  Returning ``(lo + hi) / 2`` on early termination would
-    collapse to a value halfway between the bracketed limits — which is
+    collapse to a value halfway between the bracketed limits, which is
     NOT the mid that satisfied the tolerance and can miss the target by
     >20%.
     """
@@ -158,6 +159,70 @@ def _validate_curve_volume(curve: list[tuple[float, float]], target_volume_m3: f
     return abs(volume - target_volume_m3) / target_volume_m3 * 100
 
 
+def _volume_below(curve: list[tuple[float, float]], depth_limit: float) -> float:
+    """Trapezoidal stage-storage up to ``depth_limit`` (linear area interpolation)."""
+    if len(curve) < 2 or depth_limit <= curve[0][0]:
+        return 0.0
+    vol = 0.0
+    for (d0, a0), (d1, a1) in itertools.pairwise(curve):
+        if d1 <= depth_limit:
+            vol += (a0 + a1) / 2.0 * (d1 - d0)
+        else:  # partial segment up to depth_limit
+            if d0 < depth_limit and d1 > d0:
+                frac = (depth_limit - d0) / (d1 - d0)
+                a_mid = a0 + frac * (a1 - a0)
+                vol += (a0 + a_mid) / 2.0 * (depth_limit - d0)
+            break
+    return vol
+
+
+def _pond_qa_warnings(
+    idx: Any,
+    curve: list[tuple[float, float]],
+    max_depth: float,
+    bottom_area: float,
+    area_m2: float,
+    orifice_diam: float,
+    weir_crest: float,
+    pond_design: PondDesign,
+) -> None:
+    """Log spec S11 QA diagnostics (bottom-area band, weir activation volume, drawdown time).
+
+    Pure post-hoc checks over the already-sized geometry, they emit warnings so
+    a user can spot ponds outside the design envelope, and never change the model.
+    """
+    # S11.1, bottom-area ratio bands (>=0.30 pass, 0.20-0.30 warn, <0.20 fail).
+    if area_m2 > 0:
+        ratio = bottom_area / area_m2
+        if ratio < 0.20:
+            logger.warning(f"pond {idx}: bottom-area ratio {ratio:.2f} < 0.20 (S11.1 fail).")
+        elif ratio < 0.30:
+            logger.warning(f"pond {idx}: bottom-area ratio {ratio:.2f} in 0.20-0.30 (S11.1 warn).")
+
+    # S11.3, weir activation volume: V(weir_crest)/V_total should be >= 0.85,
+    # so the spillway activates only near-full (extreme events).
+    v_total = _curve_volume(curve)
+    if v_total > 0:
+        activation = _volume_below(curve, weir_crest) / v_total
+        if activation < 0.85:
+            logger.warning(
+                f"pond {idx}: weir activation volume ratio {activation:.2f} < 0.85 (S11.3), "
+                f"spillway may engage during design (not just extreme) storms."
+            )
+
+    # S11.2, orifice drawdown time t = V / (Cd*A*sqrt(2*g*0.5*Dmax)) should be 24-72 h.
+    orifice_area = math.pi * orifice_diam**2 / 4.0
+    head = 0.5 * max_depth
+    if orifice_area > 0 and head > 0:
+        q_avg = pond_design.orifice_cd * orifice_area * math.sqrt(2.0 * 9.81 * head)
+        if q_avg > 0:
+            t_hr = v_total / (q_avg * 3600.0)
+            if t_hr < 24.0 or t_hr > 72.0:
+                logger.warning(
+                    f"pond {idx}: orifice drawdown time {t_hr:.0f} h outside 24-72 h (S11.2)."
+                )
+
+
 def _orifice_diameter_m(volume_m3: float) -> float:
     """Select orifice diameter from Opti CMAC table based on controllable volume."""
     vol_cuft = volume_m3 * _M3_TO_CUFT
@@ -176,6 +241,55 @@ def _weir_length_m(surface_area_m2: float, default_length_m: float) -> float:
     return min(max(3.0, 0.10 * l_surface), 10.0) if l_surface > 0 else default_length_m
 
 
+def _apply_pond_geometry(
+    graph: nx.MultiDiGraph[Any],
+    storage_id: Any,
+    pond_design: PondDesign,
+    area_m2: float,
+    max_depth: float,
+    invert_elev: float,
+) -> None:
+    """Persist a pond's depth-dependent geometry to its STORAGE node and outlets.
+
+    Recomputes the FDOT volume, stage-area curve, orifice diameter, weir length
+    and weir crest for ``max_depth`` and writes them (with the invert) onto the
+    node, then mirrors the orifice/weir values onto the pond's already-created
+    outlet EDGES so the stored curve top AND the emitted outlet structure follow
+    the (possibly deepened) MaxDepth.  The outlet edges are the channel the INP
+    writer actually reads: without the edge update a deepened pond would keep a
+    weir crest sized for its pre-deepen depth.  Call this whenever
+    ``chamber_floor_elevation`` / ``wb_max_depth`` change after the initial
+    sizing (it is used by ``route_pipes_into_ponds``, after the outlet edges
+    exist).
+    """
+    volume_m3 = _fdot_volume_m3(
+        area_m2, pond_design.fdot_volume_intercept, pond_design.fdot_volume_slope
+    )
+    node = graph.nodes[storage_id]
+    node["wb_max_depth"] = max_depth
+    node["chamber_floor_elevation"] = invert_elev
+    node["wb_stage_area_curve"] = _stage_area_curve(
+        area_m2,
+        max_depth,
+        pond_design.side_slope_pct,
+        pond_design.bottom_area_min_ratio,
+        pond_design.n_curve_points,
+    )
+    node["wb_orifice_diam_m"] = _orifice_diameter_m(volume_m3)
+    node["wb_weir_length_m"] = _weir_length_m(area_m2, pond_design.weir_length_m)
+    node["wb_weir_crest_m"] = pond_design.weir_crest_ratio * max_depth
+
+    # Mirror onto the outlet structure edges the INP writer reads (created by
+    # finalize_pond_outlets before this runs); otherwise these node writes are
+    # inert and the deepened pond keeps its pre-deepen weir crest.
+    for _u, _v, _k, ed in graph.out_edges(storage_id, keys=True, data=True):
+        if ed.get("edge_type") == "orifice":
+            ed["orifice_diam_m"] = node["wb_orifice_diam_m"]
+        elif ed.get("edge_type") == "weir":
+            ed["weir_crest_m"] = node["wb_weir_crest_m"]
+            ed["weir_length_m"] = node["wb_weir_length_m"]
+
+
 def _classify_water_body(
     row: pd.Series[Any],
     pond_design: PondDesign,
@@ -185,7 +299,7 @@ def _classify_water_body(
     Classification rule (see PondDesign references):
 
     1. Explicit lake-family OSM tag (``water`` in ``lake_osm_tags``):
-       always ``lake`` — respects explicit natural-feature tagging.
+       always ``lake``, respects explicit natural-feature tagging.
     2. Otherwise, apply the limnological area threshold (Richardson
        et al. 2022): area <= ``max_pond_area_m2`` -> ``pond``,
        otherwise ``lake``.
@@ -198,7 +312,7 @@ def _classify_water_body(
     extrapolation outside the validated envelope, regardless of how
     the feature is tagged in OSM.  Large designed basins may be
     legitimate engineered facilities, but their stage-storage-outlet
-    behaviour needs site-specific data, not a subdivision-pond
+    behavior needs site-specific data, not a subdivision-pond
     regression.  For those cases users can raise ``max_pond_area_m2``
     in PondDesign explicitly.
 
@@ -242,7 +356,7 @@ def _load_water_body_polygons(
     orifice + weir outlets; lakes are modeled as fixed-stage OUTFALL
     boundaries (receiving waters) without active outlet structures.
 
-    Classification blends NLCD (area-only) and OSM (tag + area) — see
+    Classification blends NLCD (area-only) and OSM (tag + area), see
     :func:`_classify_water_body` for the rule.
     """
     layers = (
@@ -296,7 +410,7 @@ def _network_nodes_gdf(graph: nx.Graph[Any]) -> gpd.GeoDataFrame:
         if "x" not in d or "y" not in d:
             continue
         if d.get("node_type") == "water_body":
-            # Skip ponds we've already inserted — otherwise a second pond
+            # Skip ponds we've already inserted, otherwise a second pond
             # could snap onto the first.
             continue
         is_river = any(
@@ -322,7 +436,7 @@ def _overtopping_crest_elev(
     """Estimate a pond's overtopping-crest elevation from the DEM.
 
     Samples the (non-hydroflattened) terrain on a ring just outside the water
-    polygon — the surrounding embankment / grade that pond water must rise
+    polygon, the surrounding embankment / grade that pond water must rise
     above to spill onto the street.  Returns the 25th-percentile ring
     elevation (closer to the low point of the rim, where overtopping actually
     begins, rather than the mean grade), or NaN if no valid pixels.  Used to
@@ -369,7 +483,7 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
     1. Find the subcatchment whose polygon contains the pond centroid.
        If one exists and hasn't already been claimed by a larger pond in
        the same subcatchment, that subcatchment's ``Outlet`` is rewritten
-       to the new pond STORAGE id — so the subcatchment's surface runoff
+       to the new pond STORAGE id, so the subcatchment's surface runoff
        drains directly into the pond, matching the calibrated reference-model pattern
        (``SUB.Outlet = STORAGE``).  The pond's ``pond_connector`` edge is
        anchored to the subcatchment's ORIGINAL pour point, so the pond's
@@ -377,7 +491,7 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
        used to discharge.
     2. Ponds that don't fall inside any subcatchment (or whose subcatchment
        is already claimed) fall back to the ``nearest network node``
-       behaviour — the pond is still integrated, just without rerouting a
+       behavior, the pond is still integrated, just without rerouting a
        subcatchment to it.
 
     The updated subcatchments parquet is written back so downstream steps
@@ -401,7 +515,7 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
     # Only designed-pond class bodies get FDOT V-A sizing + Opti-CMAC
     # orifice/weir outlets.  Larger lakes / reservoirs stay in the
     # hydroflattened DEM so surface runoff still routes toward them, but
-    # they are not modelled as detention ponds — that would apply the
+    # they are not modeled as detention ponds, that would apply the
     # Florida subdivision calibration envelope (Harper & Baker 2007)
     # miles outside its validated range.
     n_total = len(all_wb)
@@ -421,7 +535,7 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
         logger.warning("No network nodes with coordinates; skipping pond insertion.")
         return graph
 
-    # Subcatchments parquet is optional — if it doesn't exist (e.g. bbox
+    # Subcatchments parquet is optional, if it doesn't exist (e.g. bbox
     # had no usable DEM), fall back to nearest-node snapping for every pond.
     subs_path = addresses.model_paths.subcatchments
     subs_gdf: gpd.GeoDataFrame | None = None
@@ -482,7 +596,7 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
 
         # --- Decide the pond's downstream-network anchor -----------------
         # Preference 1: the pond sits inside a subcatchment that no larger
-        # pond has already claimed — anchor to that sub's original pour
+        # pond has already claimed, anchor to that sub's original pour
         # point and reroute the sub to the pond.
         anchor_node: Any | None = None
         sub_row = None
@@ -521,16 +635,16 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
         # radius), replace the anchor with a fresh sink snapped onto the
         # canal at the nearest point.  Snapping onto the centerline (rather
         # than wiring to a river graph node) matters because river features
-        # are noded only at their endpoints, often hundreds of metres away.
+        # are noded only at their endpoints, often hundreds of meters away.
         # The sink reuses ``node_type="river_outfall"`` so identify_outfalls
         # samples the receiving water's DEM stage for it and post_processing
         # routes it to [OUTFALLS]; derive_topology preserves it alongside
         # the pond storage.  The subcatchment claim below (Outlet rewrite +
-        # contributing_area transfer) is unaffected — only WHERE the pond
+        # contributing_area transfer) is unaffected, only WHERE the pond
         # discharges changes.
         intercept_node = None
         if river_tree is not None:
-            poly = wb_row.geometry
+            poly: Any = wb_row.geometry  # GeoDataFrame row .geometry is a shapely geom at runtime
             near_idx = int(river_tree.nearest(poly))
             d_canal = shapely.distance(poly, river_geoms[near_idx])
             anchor_pt = shapely.Point(graph.nodes[anchor_node]["x"], graph.nodes[anchor_node]["y"])
@@ -585,6 +699,11 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
         weir_length = _weir_length_m(area_m2, pond_design.weir_length_m)
         weir_crest = pond_design.weir_crest_ratio * max_depth
 
+        # Spec S11 QA diagnostics (warnings only; do not change the model).
+        _pond_qa_warnings(
+            idx, curve, max_depth, bottom_area, area_m2, orifice_diam, weir_crest, pond_design
+        )
+
         # --- Add pond STORAGE node ---------------------------------------
         storage_id = next_node_id
         next_node_id += 1
@@ -635,7 +754,7 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
 
         # --- Add the pond_connector edge (pond -> anchor) ---------------
         # ``contributing_area`` is zeroed so the edge is a no-op in
-        # topology weight calculation — subcatchment runoff is routed
+        # topology weight calculation, subcatchment runoff is routed
         # directly to the pond STORAGE node via SWMM Outlet, so the
         # connector is not a pipe-flow path that needs sizing.
         ax = graph.nodes[anchor_node]["x"]
@@ -658,7 +777,7 @@ def insert_pond_nodes(  # noqa: C901, PLR0912, PLR0915 - subcatchment reroute + 
 
     # Persist the subcatchment Outlet rewrites, if any.  Cast to int64 after
     # mapping because the source column is sometimes float64 (pandas widens
-    # to float when any upstream operation produced a NaN) — a stringified
+    # to float when any upstream operation produced a NaN), a stringified
     # "4562.0" wouldn't match the integer node IDs in the graph.
     if id_updates and subs_gdf is not None:
         subs_gdf = subs_gdf.copy()
@@ -684,13 +803,13 @@ def _pond_has_viable_outfall(  # noqa: C901 - single BFS with in-loop terminal h
     BFS forward from the pond storage through orifice/weir → outlet_junction
     → pond_outflow → downstream pipes/rivers/outfall edges.  A pond is
     "gravity-viable" iff at least one reachable terminal sink (node with
-    out-degree 0 in the directed flow graph — SWMM outfall) clears the
+    out-degree 0 in the directed flow graph, SWMM outfall) clears the
     head requirement below the pond's max water surface elevation:
 
     - Terminals carrying a real receiving-water stage
       (``node_type`` ``river_outfall`` / ``water_body_outfall``, whose
       invert is the hydroflattened DEM stage of the canal) need only a
-      small driving head — 0.1 m plus the minimum-slope drop accumulated
+      small driving head, 0.1 m plus the minimum-slope drop accumulated
       over the path.  A pond whose max WSE sits above the adjacent
       canal's water surface drains by gravity; demanding the flat
       ``min_head_drop_m`` (sized for derived-invert terminals) against a
@@ -701,7 +820,7 @@ def _pond_has_viable_outfall(  # noqa: C901 - single BFS with in-loop terminal h
 
     Ponds that reach only perched terminals (head drop too small to
     drive sustained flow through the path's flat conduits) return
-    ``False`` and should be modelled as closed-basin retention with
+    ``False`` and should be modeled as closed-basin retention with
     Green-Ampt exfiltration.
     """
     if pond_storage_id not in graph.nodes:
@@ -712,7 +831,7 @@ def _pond_has_viable_outfall(  # noqa: C901 - single BFS with in-loop terminal h
         invert = pdata.get("chamber_floor_elevation")
         depth = pdata.get("wb_max_depth", 0)
         if invert is None:
-            return True  # can't decide; default to "viable" (preserve current behaviour)
+            return True  # can't decide; default to "viable" (preserve current behavior)
         pond_max_wse = float(invert) + float(depth)
     pond_max_wse = float(pond_max_wse)
 
@@ -720,14 +839,14 @@ def _pond_has_viable_outfall(  # noqa: C901 - single BFS with in-loop terminal h
     stage_margin_m = 0.1  # driving head over the receiving water's stage
 
     visited: set[Any] = {pond_storage_id}
-    # (node, cumulative path length in m) — BFS first-visit length is a
+    # (node, cumulative path length in m), BFS first-visit length is a
     # good-enough proxy for the min-slope head allowance.
     queue: list[tuple[Any, float]] = [(pond_storage_id, 0.0)]
     while queue:
         node, cum_m = queue.pop(0)
         out_edges = list(graph.out_edges(node, keys=True))
         if not out_edges and node != pond_storage_id:
-            # Terminal SWMM outfall — check head drop.
+            # Terminal SWMM outfall, check head drop.
             v_invert = graph.nodes[node].get("chamber_floor_elevation")
             if v_invert is None:
                 continue
@@ -790,18 +909,18 @@ def _nearest_drainable_anchor(
     """Find the euclidean-nearest junction the pond can gravity-drain to.
 
     A candidate must (a) carry a ``chamber_floor_elevation`` with
-    ``cfe + min_slope * distance < pond_max_wse`` — the slope allowance
+    ``cfe + min_slope * distance < pond_max_wse``, the slope allowance
     guarantees the in_offset logic downstream places the conduit inlet
     strictly below the pond's max WSE (no perched/dead outlets, which the
     old downstream-DAG walk produced by accepting inverts that cleared the
     WSE by centimetres); (b) drain to a SWMM outfall (``drains_to_outfall``
-    closure — canal-stub fragments in other components qualify, dead-end
+    closure, canal-stub fragments in other components qualify, dead-end
     junctions do not); (c) not be upstream of the pond itself (cycle
     guard); (d) not be a pond storage or outlet_junction; (e) not lie on
-    the far side of a river — an outfall conduit does not cross a canal,
+    the far side of a river, an outfall conduit does not cross a canal,
     so candidates whose straight segment from the pond crosses a river
     centerline are rejected (the caller offers the canal itself as the
-    alternative).  Geometric nearness directly minimises the conduit
+    alternative).  Geometric nearness directly minimizes the conduit
     length, unlike the old walk which searched only the downstream cone
     of an uphill anchor and routinely returned 300-500 m ridge-crossing
     targets.
@@ -859,7 +978,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
     1. Finds the surviving pond_connector edge(s) out of the storage node,
        identifies the provisional downstream network node, and removes the
        edge.
-    2. **Validates that the downstream node is physically drainable** —
+    2. **Validates that the downstream node is physically drainable**,
        its invert must sit below the pond's max water surface elevation
        (``pond_invert + wb_max_depth``), otherwise gravity flow is
        impossible.  Three-tier rescue:
@@ -919,7 +1038,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
 
     # River centerlines: junction candidates must not lie across a canal
     # (an outfall conduit does not cross a river), and the canal itself is
-    # a first-class rescue target — when it is nearer than any drainable
+    # a first-class rescue target, when it is nearer than any drainable
     # junction and the pond clears its (hydroflattened DEM) stage, the
     # pond discharges to a sink snapped onto the canal instead.
     rescue_river_geoms = [
@@ -929,7 +1048,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
     ]
     rescue_river_tree = shapely.STRtree(rescue_river_geoms) if rescue_river_geoms else None
     dem_src = None
-    if rescue_river_tree is not None and addresses is not None:
+    if rescue_river_tree is not None:
         elev_path = addresses.bbox_paths.elevation
         if elev_path.exists():
             import rasterio
@@ -978,11 +1097,11 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
             # below the pond's max WSE; if not, find the geometrically
             # nearest junction that is (with a slope allowance so the
             # rescued conduit inlet lands strictly below the WSE).  We
-            # only reroute if the search finds a usable anchor —
+            # only reroute if the search finds a usable anchor,
             # otherwise we leave the pond attached to the provisional
             # node and let the pipe in_offset logic below either raise
             # the pipe (if the mismatch is small) or accept a
-            # non-draining pond (closed-basin behaviour handled by step
+            # non-draining pond (closed-basin behavior handled by step
             # 3 of the improvement plan).  Canal-anchored ponds (sink is
             # a river_outfall) are never rescued away from their canal.
             ds_invert_raw = graph.nodes[downstream_node].get("chamber_floor_elevation")
@@ -1010,7 +1129,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
                 # the best drainable junction and the pond clears the
                 # canal's water stage (hydroflattened DEM at the snap
                 # point) with the same slope allowance, discharge to a
-                # sink snapped onto the canal — the FDOT answer for a
+                # sink snapped onto the canal, the FDOT answer for a
                 # canal-adjacent pond, and the only crossing-free target
                 # when every near junction sits on the far bank.  The
                 # displaced anchor keeps the interception role.
@@ -1066,14 +1185,14 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
                     # produce gravity drainage:
                     #
                     # (a) pond top must sit above the downstream pipe
-                    #     invert plus minimum-slope head — otherwise
+                    #     invert plus minimum-slope head, otherwise
                     #     water physically cannot reach the pipe inlet
                     #     no matter how deep we dig (closed basin).
                     # (b) the required depth must be within the FDOT
                     #     design cap (``max_depth_m``, 3.81 m default);
                     #     deeper excavations are unrealistic for the
                     #     subdivision-pond class of structures we are
-                    #     modelling.
+                    #     modeling.
                     dx_tmp = graph.nodes[downstream_node]["x"]
                     dy_tmp = graph.nodes[downstream_node]["y"]
                     est_pipe_length = max(
@@ -1140,7 +1259,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
                             reason = (
                                 f"pond top ({storage_se:.2f} m) sits below "
                                 f"the provisional pipe invert "
-                                f"({ds_invert_initial:.2f} m) — gravity "
+                                f"({ds_invert_initial:.2f} m), gravity "
                                 "drainage impossible regardless of depth"
                             )
                         else:
@@ -1152,7 +1271,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
                         logger.warning(
                             f"pond {storage_id}: no drainable downstream node "
                             f"within {pond_design.downstream_search_max_m:.0f} m "
-                            f"and {reason}; modelling as closed basin with "
+                            f"and {reason}; modeling as closed basin with "
                             "surface ponding + seepage exfiltration."
                         )
 
@@ -1235,7 +1354,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
     # Drop pond storage nodes that lost their pond_connector during topology
     # derivation (e.g. because the connector's downstream endpoint was pruned).
     # Such ponds have no orifice, no weir, no outflow conduit and would land
-    # in the .inp as disconnected STORAGE nodes — water can enter via
+    # in the .inp as disconnected STORAGE nodes, water can enter via
     # subcatchment Outlet routing but can never leave, producing spurious
     # continuity error.  We also reroute any subcatchments that were pointed at the pond
     # back to the pond's original ``wb_snapped_to`` anchor so their runoff
@@ -1300,7 +1419,7 @@ def finalize_pond_outlets(  # noqa: C901, PLR0912, PLR0915 - replaces every pond
                 graph.nodes[pid]["wb_closed_basin"] = True
                 converted += 1
                 logger.info(
-                    f"pond {pid}: marking closed-basin — no SWMM outfall "
+                    f"pond {pid}: marking closed-basin, no SWMM outfall "
                     f"reachable with >= {min_head_drop:.1f} m head drop below "
                     f"pond max WSE on any forward path; will rely on "
                     "Green-Ampt seepage for drainage."
@@ -1353,7 +1472,7 @@ def partition_pond_network(  # noqa: C901, PLR0912, PLR0915 - storage/ds_node-mo
       ``pond_outflow`` edge).  BFS collects everything upstream of that
       junction.  Correct for *pipe rerouting* (we want every feeder
       that lands at the ds_node), but for *pondshed delineation* it
-      over-collects — it sweeps in subs that bypass the pond and merely
+      over-collects, it sweeps in subs that bypass the pond and merely
       share its downstream junction, producing spatially-disconnected
       pondsheds.
 
@@ -1373,7 +1492,7 @@ def partition_pond_network(  # noqa: C901, PLR0912, PLR0915 - storage/ds_node-mo
     Algorithm:
 
     1. Build a filtered drainage network containing only the edge types we
-       care about for pond routing — by default pipes, surface dual-drainage
+       care about for pond routing, by default pipes, surface dual-drainage
        channels, and pond outlet/outflow connectors (drops natural
        ``river`` edges).
     2. Identify two kinds of sinks:
@@ -1430,7 +1549,7 @@ def partition_pond_network(  # noqa: C901, PLR0912, PLR0915 - storage/ds_node-mo
     # river centerline, where no pipes exist to intercept.  Their street
     # interception point is the pour-point anchor displaced at insert time
     # (``wb_intercept_node``), so in ds_node mode the pond is also
-    # registered there — feeder pipes arriving at that junction reroute
+    # registered there, feeder pipes arriving at that junction reroute
     # through the pond (detention) before it releases to the canal.
     if pond_sink_mode == "ds_node":
         for p in pond_set:
@@ -1489,7 +1608,7 @@ def partition_pond_network(  # noqa: C901, PLR0912, PLR0915 - storage/ds_node-mo
         # storage node (via predecessors) is exactly its pond_inflow
         # feeders + their pipe catchment + subs whose Outlet is the
         # storage.  Orifice / weir / pond_outflow are storage
-        # *successors*, so a predecessor-BFS never crosses them — the
+        # *successors*, so a predecessor-BFS never crosses them, the
         # pondshed cannot leak past the pond's own outlet.  Each storage
         # is its own sink, so there is no multi-pond tiebreak.
         pond_sinks: set[Any] = set(pond_set)
@@ -1547,7 +1666,7 @@ def _compute_pond_outflow_carriers(
     """Forward-BFS from every pond ds_node; returns the union of visited nodes.
 
     Used by :func:`route_pipes_into_ponds` to skip pipes whose upstream
-    end is downstream of another pond's outflow — those pipes carry pond
+    end is downstream of another pond's outflow, those pipes carry pond
     A's released water and must not be rerouted into pond B (per the
     spec: pond B's controls only see its own pondshed).  The set
     INCLUDES the source ds_nodes themselves so the rule also catches
@@ -1580,7 +1699,7 @@ def route_pipes_into_ponds(  # noqa: C901, PLR0912, PLR0915 - canonical EPA rero
 
     Implements the canonical SWMM detention-pond connectivity pattern
     documented in the EPA SWMM 5 Applications Manual (Rossman 2009),
-    Example 3 — Detention Pond Design:
+    Example 3, Detention Pond Design:
 
         "The storage unit is first connected to the rest of the
         drainage system. This can be done by changing culvert C11's
@@ -1596,7 +1715,7 @@ def route_pipes_into_ponds(  # noqa: C901, PLR0912, PLR0915 - canonical EPA rero
     sink hosts a cluster of ponds.
 
     Pipes whose ``u`` is downstream of *any* pond's outflow are
-    skipped — they carry that upstream pond's released water and must
+    skipped, they carry that upstream pond's released water and must
     not feed back into another pond (per the spec: each pond's
     controls only see its own pondshed; cascading pond outflows merge
     passively at their shared downstream junction, not through
@@ -1606,7 +1725,7 @@ def route_pipes_into_ponds(  # noqa: C901, PLR0912, PLR0915 - canonical EPA rero
     Adverse-slope guarantee: the rerouter computes
     ``in_offset = (D_invert - P_invert) + pond_inflow_offset_m`` so the
     pipe's downstream end stays at (or above) the elevation it had at
-    the original ds_node — preserving the pipe's original positive
+    the original ds_node, preserving the pipe's original positive
     slope.  Because :func:`finalize_pond_outlets` already ensured
     ``P_invert <= D_invert`` for every gravity-drained pond, the
     slope-preserving offset is non-negative by construction.  For
@@ -1661,7 +1780,7 @@ def route_pipes_into_ponds(  # noqa: C901, PLR0912, PLR0915 - canonical EPA rero
             continue
         target_pond = node_to_pond.get(u)
         if target_pond is None:
-            # u has no partition assignment (e.g. detached subgraph) —
+            # u has no partition assignment (e.g. detached subgraph),
             # fall back to the closest pond at this ds_node.
             ponds_here = pond_outlets[v]
             ux, uy = graph.nodes[u]["x"], graph.nodes[u]["y"]
@@ -1715,9 +1834,18 @@ def route_pipes_into_ponds(  # noqa: C901, PLR0912, PLR0915 - canonical EPA rero
             # Deepen to D_invert (capped at max_depth).
             new_p_invert = max(d_invert, p_surface - max_depth)
             if new_p_invert < p_invert:
-                # Successful deepen
-                graph.nodes[pond_id]["chamber_floor_elevation"] = new_p_invert
-                graph.nodes[pond_id]["wb_max_depth"] = p_surface - new_p_invert
+                # Successful deepen, rebuild the full depth-dependent geometry
+                # (stage-area curve, weir crest, orifice) so the stored curve
+                # top and weir crest follow the new, deeper MaxDepth instead of
+                # lagging at the pre-deepen depth.
+                _apply_pond_geometry(
+                    graph,
+                    pond_id,
+                    pond_design,
+                    float(pdata.get("wb_area_m2", 0.0)),
+                    p_surface - new_p_invert,
+                    new_p_invert,
+                )
                 p_invert = new_p_invert
                 deepened_ponds += 1
 
@@ -1788,10 +1916,10 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
     whose ds_node has no pipe predecessors, and rescue chains that land
     ponds on each other's anchors all leave detention dormant while the
     surrounding blocks bypass it.  Physically these subdivision ponds ARE
-    the detention for their neighbouring blocks (SJRWMD/FDOT permitting),
+    the detention for their neighboring blocks (SJRWMD/FDOT permitting),
     so this step changes ``Sub.Outlet`` from the current network node to
     the pond storage node for orphan subs in each pond's natural drainage
-    neighbourhood, subject to a per-pond catchment cap derived from the
+    neighborhood, subject to a per-pond catchment cap derived from the
     pond's physical storage capacity (FDOT 1-inch water-quality rule,
     Florida ERP design practice).
 
@@ -1799,7 +1927,7 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
 
     1. The sub is an orphan under the DELINEATION-CONSISTENT storage-mode
        :func:`partition_pond_network` map (the same partition
-       :func:`post_processing.generate_pondsheds` uses) — i.e. its runoff
+       :func:`post_processing.generate_pondsheds` uses), i.e. its runoff
        does not already transit any pond storage.  The earlier ds_node-mode
        check over-collected (it attributed subs to ponds merely sharing a
        downstream junction) and, combined with an isolation gate that a
@@ -1809,15 +1937,15 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
        the sub centroid and the pond storage centroid.
     3. That distance is ``≤ pond_design.sub_reroute_max_distance_m``, the
        sub is not river-fronting (within a street-block ~60 m of a river
-       centerline that is nearer than the pond — those subs drain to the
+       centerline that is nearer than the pond, those subs drain to the
        canal directly), and the straight line from the sub to the pond
        does not cross a river centerline (capture never reaches across a
-       canal — the source of far-bank MultiPolygon pondshed fragments).
+       canal, the source of far-bank MultiPolygon pondshed fragments).
     4. The pond has not yet exhausted its design catchment cap, computed
-       as ``wb_volume_m3 / (water_quality_depth_m * runoff_coeff)`` —
+       as ``wb_volume_m3 / (water_quality_depth_m * runoff_coeff)``,
        i.e. the catchment area such that 1 inch of runoff fills the
        pond's design volume (Florida ERP/FDOT water-quality treatment
-       rule; SJRWMD AH Vol. II §10.2) — where the cap is first DEBITED
+       rule; SJRWMD AH Vol. II §10.2), where the cap is first DEBITED
        by the area the pond's storage-mode pondshed already captures
        through the pipe network.  Subs are added in nearest-first order
        until cumulative captured area reaches the cap; remaining subs
@@ -1860,7 +1988,7 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
     if subs_gdf.empty:
         return graph
 
-    # Delineation-consistent partition (storage mode, piped-only keep set —
+    # Delineation-consistent partition (storage mode, piped-only keep set,
     # matches generate_pondsheds): a sub counts as "already captured" only
     # when its runoff actually transits a pond storage, not when it merely
     # shares a downstream junction with one.
@@ -1871,12 +1999,12 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
 
     # Coordinates of every pond.  A sub is only rerouted to its nearest
     # pond *overall*, never pulled overland past a closer pond to a
-    # farther one — which is what produced spatially-disconnected
+    # farther one, which is what produced spatially-disconnected
     # pondsheds before the nearest-pond rule.
     all_pond_coords = {
         pid: (float(graph.nodes[pid]["x"]), float(graph.nodes[pid]["y"])) for pid in ponds
     }
-    # Per-pond catchment cap (m²) — FDOT 1-inch water-quality rule scaled
+    # Per-pond catchment cap (m²), FDOT 1-inch water-quality rule scaled
     # by the multiplier.  Falls back to a generous default if the pond's
     # design volume attribute is missing (shouldn't happen post-
     # insert_pond_nodes but defensive).
@@ -1901,7 +2029,7 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
             captured_m2[pid] += float(sub_row["area"])
 
     # River centerlines: a sub whose nearest receiving water is the canal
-    # itself must not be pulled overland into a pondshed — that is what
+    # itself must not be pulled overland into a pondshed, that is what
     # painted river corridors as pondsheds and created cross-river
     # MultiPolygon fragments (if the straight line from a sub to a pond
     # crosses the canal, the canal is by construction the closer water).
@@ -1949,7 +2077,7 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
         if river_tree is not None:
             # River-frontage band: a sub within a street-block of the
             # canal (and nearer to it than to the pond) drains to the
-            # canal directly — these are the corridor subs that painted
+            # canal directly, these are the corridor subs that painted
             # the rivers as pondsheds.  Mid-block subs farther from the
             # water stay with their subdivision pond even when the canal
             # is geometrically closer.
@@ -2007,7 +2135,7 @@ def reroute_subs_to_isolated_ponds(  # noqa: C901, PLR0912, PLR0915 - Voronoi as
 
     # Apply reroutes to subs.parquet.
     subs_gdf = subs_gdf.copy()
-    subs_gdf["id"] = subs_gdf["id"].map(lambda v: reroutes.get(int(v), v)).astype("int64")
+    subs_gdf["id"] = subs_gdf["id"].map(lambda v: reroutes.get(int(v), v)).astype("int64")  # pyright: ignore[reportArgumentType]
     subs_gdf.to_parquet(subs_path)
 
     n_ponds_helped = len(set(reroutes.values()))
@@ -2064,7 +2192,7 @@ def reroute_enclosed_gap_subs(
     distant outfall, geographically splitting the pond's captured catchment
     into pieces.  Where such outfall-bound subs are spatially **enclosed** by
     the pond's own catchment (they fall in the gap between the pond's pieces),
-    they belong to the pond's natural drainage neighbourhood — the long route
+    they belong to the pond's natural drainage neighborhood, the long route
     to a distant outfall is a shortest-path artifact, not a real divide.
 
     For each pond whose catchment is a MultiPolygon, the gap region is the
@@ -2075,7 +2203,7 @@ def reroute_enclosed_gap_subs(
     storage, so the pond captures its contiguous catchment.  A conservative
     ``R`` keeps this to truly-enclosed gaps; wider outfall corridors (only
     partly bounded by the pond) are left alone to avoid the over-reach that
-    re-fragments neighbouring pondsheds.  ``enclosed_gap_close_m = 0`` disables
+    re-fragments neighboring pondsheds.  ``enclosed_gap_close_m = 0`` disables
     the step.
     """
     close = float(pond_design.enclosed_gap_close_m)
@@ -2093,7 +2221,7 @@ def reroute_enclosed_gap_subs(
     if crs and subs_gdf.crs and str(subs_gdf.crs) != str(crs):
         subs_gdf = subs_gdf.to_crs(crs)
 
-    # Delineation-consistent partition (storage mode, piped-only keep set —
+    # Delineation-consistent partition (storage mode, piped-only keep set,
     # matches generate_pondsheds, so the gaps we close are the ones that show
     # up as MultiPolygon pondsheds).
     keep = frozenset({"pipe", "orifice", "weir", "pond_inflow", "pond_outflow", "outfall"})
@@ -2121,7 +2249,7 @@ def reroute_enclosed_gap_subs(
             )
             graph.nodes[orig_id]["contributing_area"] = 0.0
 
-    subs_gdf["id"] = subs_gdf["_sid"].map(lambda v: reroutes.get(int(v), v)).astype("int64")
+    subs_gdf["id"] = subs_gdf["_sid"].map(lambda v: reroutes.get(int(v), v)).astype("int64")  # pyright: ignore[reportArgumentType]
     subs_gdf = subs_gdf.drop(columns=["_sid", "_pp"])
     subs_gdf.to_parquet(subs_path)
     logger.info(
@@ -2210,19 +2338,19 @@ def resize_pond_orifices(  # noqa: C901, PLR0912, PLR0915 - FDOT orifice re-sizi
     detention pond (< 2 ha, < 2 m deep).  When a pond's subcatchment is
     larger than the calibration envelope, or when ``finalize_pond_outlets``
     reroutes the pond to a substantially deeper anchor, the Opti-CMAC
-    diameter is undersized for the pond's actual peak inflow — the pond
+    diameter is undersized for the pond's actual peak inflow, the pond
     fills faster than the orifice can drain, overtops, and contributes to
     the simulated flooding loss even after ``resize_street_pipes_for_pond_routing``
     has made the downstream pipes large enough.
 
     This step resizes orifices with two guardrails:
 
-    - **Design criterion cap** — diameter never exceeds
+    - **Design criterion cap**, diameter never exceeds
       ``pond_design.max_orifice_diameter_m`` (default 0.9144 m = 36 in,
       FDOT / SJRWMD subdivision-class limit).  Standard sizes (6 / 8 / 12
       / 18 / 24 / 30 / 36 / 48 in) come from
       ``pond_design.orifice_standard_diameters_m``.
-    - **Hydraulic feasibility** — the target orifice flow is capped at
+    - **Hydraulic feasibility**, the target orifice flow is capped at
       ``orifice_sizing_pipe_fraction`` x Q_full of the first downstream
       street pipe, so the new orifice does NOT move the hydraulic
       bottleneck downstream to the pipe junction and create a new
@@ -2236,7 +2364,7 @@ def resize_pond_orifices(  # noqa: C901, PLR0912, PLR0915 - FDOT orifice re-sizi
     equation ``Q = Cd * A * sqrt(2 g H)`` with H = pond max depth
     (plus closed-basin SurDepth where applicable), and the smallest
     standard diameter that meets or exceeds the requirement is picked.
-    The orifice is never shrunk — Opti-CMAC's table stays the lower bound.
+    The orifice is never shrunk, Opti-CMAC's table stays the lower bound.
 
     References:
         FDOT Drainage Design Guide Ch. 9 (orifice / riser sizing).
@@ -2246,7 +2374,7 @@ def resize_pond_orifices(  # noqa: C901, PLR0912, PLR0915 - FDOT orifice re-sizi
     graph = graph.copy()
 
     # Rational-method peak flow at each node, accumulated through the
-    # current topology — mirrors pipe_by_pipe / resize_street_pipes Pass 1.
+    # current topology, mirrors pipe_by_pipe / resize_street_pipes Pass 1.
     topological_order = list(nx.topological_sort(graph))
     cumulative_area: dict[Any, float] = {}
     for node in topological_order:
@@ -2297,7 +2425,7 @@ def resize_pond_orifices(  # noqa: C901, PLR0912, PLR0915 - FDOT orifice re-sizi
         current_a = math.pi * current_diam**2 / 4.0
         current_q = cd * current_a * math.sqrt(2.0 * 9.81 * head)
         if q_target <= current_q:
-            # Already sufficient — Opti-CMAC's bin is enough.
+            # Already sufficient, Opti-CMAC's bin is enough.
             continue
 
         # Back-solve required area, then diameter.

@@ -28,7 +28,7 @@ def _get_original_bbox_4326(
 
     Captured before :func:`_get_extended_bbox` widens it by the
     processing halo, so final outputs (pondsheds, network) can be
-    clipped back to the true AOI — discarding buffer-zone artifacts.
+    clipped back to the true AOI, discarding buffer-zone artifacts.
     """
     bbox = (
         float(bbox_config["xmin"]),
@@ -245,13 +245,14 @@ def swmmanywhere(config: dict[str, Any]) -> Path:
         rain_dat_unit=swmm_settings.get("rain_dat_unit", "MM"),
         inp_options=swmm_settings.get("inp_options"),
         pond_design=params["pond_design"],
+        hydraulic_design=params["hydraulic_design"],
     )
 
     # Visualization aid: per-pond drainage-area polygons.  Only produced
     # when the pond subsystem is active (``add_pondsheds=True``); a plain
     # dual-drainage network has no ponds and hence no pondsheds.
     #
-    # AOI clipping (``clip_bbox_4326``) is intentionally OFF — the full
+    # AOI clipping (``clip_bbox_4326``) is intentionally OFF, the full
     # buffered extent is kept for diagnostics.  ``original_bbox_4326`` is
     # retained for if/when AOI clipping of final deliverables is desired.
     _ = original_bbox_4326  # reserved for optional AOI clipping
@@ -259,7 +260,7 @@ def swmmanywhere(config: dict[str, Any]) -> Path:
         generate_pondsheds(addresses)
 
     # Single-file GIS deliverable: every element class as its own layer.
-    # A failure here must not lose the run — the .inp is the authoritative
+    # A failure here must not lose the run, the .inp is the authoritative
     # output, the GeoPackage is only a review aid.
     try:
         write_geopackage(graph, addresses.model_paths.model)
