@@ -174,12 +174,12 @@ def set_elevation(
         bounds = src.bounds
         nodata = src.nodata
 
-    # ``sample_window`` returns the DEM's nodata fill — or 0 when nodata is
-    # unset — for points outside the raster.  The buffered street network can
+    # ``sample_window`` returns the DEM's nodata fill, or 0 when nodata is
+    # unset, for points outside the raster.  The buffered street network can
     # extend past the downloaded DEM tile, so peripheral nodes would otherwise
     # keep a 0 m elevation that reads as a deep pit (forcing uphill flow and
     # distorting pipe inverts).  Mark out-of-bounds and true-nodata samples as
-    # NaN so ``_interpolate_na`` fills them from the nearest valid neighbours.
+    # NaN so ``_interpolate_na`` fills them from the nearest valid neighbors.
     xy_arr = np.asarray(xys, dtype=float)
     out_of_bounds = (
         (xy_arr[:, 0] < bounds.left)
@@ -290,7 +290,7 @@ def calculate_weights(
     Returns:
         The graph with weights set on edges.
     """
-    # Calculate bounds to normalise between
+    # Calculate bounds to normalize between
     bounds: dict[Any, list[float]] = defaultdict(lambda: [np.inf, -np.inf])
 
     for w in topology_derivation.weights:
@@ -305,7 +305,7 @@ def calculate_weights(
     for _, _, d in graph.edges(data=True):
         total_weight = 0
         for attr, bds in bounds.items():
-            # Normalise
+            # Normalize
             weight = max((d[attr] - bds[0]) / (bds[1] - bds[0]), eps)
             # Exponent
             weight = weight ** getattr(topology_derivation, f"{attr}_exponent")
@@ -360,7 +360,7 @@ def _extract_non_street(
             pond_edges[(u, v, k)] = d.copy()
             for n in (u, v):
                 # Preserve the pond storage and, for canal-anchored ponds,
-                # the snapped sink on the river centerline — neither lies on
+                # the snapped sink on the river centerline, neither lies on
                 # a pipe path, so both would otherwise be pruned.
                 if (
                     graph.nodes[n].get("node_type") in ("water_body", "river_outfall")
@@ -386,7 +386,7 @@ def _reattach_rivers(  # noqa: C901 - order-dependent sequential re-add of river
     Only outfall edges whose street-side node (``u``) survived topology
     derivation are reattached, linking the pipe network to the river
     network.  Pond_connector edges are reattached whenever their
-    ``downstream_network`` endpoint is present in the reattached graph —
+    ``downstream_network`` endpoint is present in the reattached graph, 
     a street node that survived derivation or a re-added river node; the
     pond storage node itself is preserved in ``pond_data`` and re-added
     here.
@@ -448,8 +448,8 @@ def derive_topology(
     :func:`identify_outfalls`.  When
     ``topology_derivation.chahinian_angle_scaling`` > 0, a turn-angle
     transition cost (Chahinian et al. 2019, Eq. 4) is added as the
-    forest grows, favouring straight-through and right-angle junctions
-    over acute turns — see :func:`shortest_path_utils.dijkstra_pq`.
+    forest grows, favoring straight-through and right-angle junctions
+    over acute turns, see :func:`shortest_path_utils.dijkstra_pq`.
 
     Args:
         graph: A directed multi-graph with weights on edges.
@@ -476,8 +476,13 @@ def derive_topology(
     graph.remove_nodes_from(set(graph.nodes) - visited)
     graph = filter_edges(graph, frozenset({"pipe"}))
 
-    if nx.negative_edge_cycle(graph, weight="weight"):
-        logger.warning("Graph contains negative cycle")
+    # dijkstra_pq requires non-negative edge weights.  calculate_weights
+    # normalizes every factor into a strictly positive range, so this guards
+    # against a future regression rather than a live case, and replaces an
+    # O(V*E) negative-cycle scan that could never fire under that normalization
+    # (and ignored the turn-angle transition cost anyway).
+    if any(float(d.get("weight", 0.0)) < 0 for _, _, d in graph.edges(data=True)):
+        logger.warning("Graph contains negative pipe weight(s); Dijkstra forest is ill-defined")
 
     graph = shortest_path_utils.dijkstra_pq(
         graph, outfalls, angle_scaling=topology_derivation.chahinian_angle_scaling

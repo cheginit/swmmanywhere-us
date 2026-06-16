@@ -252,9 +252,12 @@ def _merge_edge_properties(edges: list[dict[str, Any]], total_length: float) -> 
     """Compute merged properties for a consolidated chain."""
     lengths = [float(d.get("length", 0)) for d in edges]
 
-    # Diameter: minimum (conservative capacity)
+    # Diameter: the governing (largest) segment.  A degree-2 chain is
+    # diameter-monotonic (non-decreasing downstream) and the merged conduit
+    # carries the chain's full SUMMED contributing area, so it must inherit the
+    # downstream-most (largest) diameter; min() would undersize it.
     diameters = [float(d.get("diameter", 0.3)) for d in edges]
-    diameter = min(diameters)
+    diameter = max(diameters)
 
     # Roughness: length-weighted average
     roughnesses = [float(d.get("roughness", 0.01)) for d in edges]
@@ -369,12 +372,15 @@ def _add_split_edges(
 
 
 def _chain_edge_data(graph: nx.MultiDiGraph[Any], chain: list[Any]) -> list[dict[str, Any]]:
-    """First street edge's data for each consecutive chain node pair."""
+    """Street-edge data for each consecutive chain pair (chain[i] -> chain[i+1])."""
     edge_data_list: list[dict[str, Any]] = []
     for i in range(len(chain) - 1):
-        u = chain[i]
-        # Get the street edge (first match)
-        for _, _, d in graph.edges(u, data=True):
+        u, v = chain[i], chain[i + 1]
+        # The chain edge is the pipe edge from u to its chain SUCCESSOR v, not
+        # merely u's first pipe out-edge, those differ when u branches (e.g.
+        # P_start), which otherwise captured the wrong length/diameter/
+        # contributing_area/geometry for the chain's first segment.
+        for d in (graph.get_edge_data(u, v) or {}).values():
             if d.get("edge_type", "pipe") in _PIPE_TYPES:
                 edge_data_list.append(d)
                 break
@@ -447,23 +453,29 @@ def _resolve_transitive(node_mapping: dict[Any, Any]) -> dict[Any, Any]:
 
 
 def _redistribute_contributing_area(
-    graph: nx.MultiDiGraph[Any], node_mapping: dict[Any, Any]
+    graph: nx.MultiDiGraph[Any], node_mapping: dict[Any, Any], own_ca: dict[Any, float]
 ) -> None:
-    """Add removed nodes' contributing area to their surviving targets."""
-    # We no longer have the removed nodes' data, so we rely on the
-    # edge contributing_area sums already captured during consolidation.
-    # The surviving nodes' contributing_area is updated from their
-    # (possibly merged) incoming edges.
-    for n in graph.nodes():
-        total_ca = 0.0
-        for _, _, d in graph.in_edges(n, data=True):
-            total_ca += float(d.get("contributing_area", 0))
-        # Also include the node's own contributing_area if it already has one
-        own_ca = float(graph.nodes[n].get("contributing_area", 0))
-        graph.nodes[n]["contributing_area"] = max(total_ca, own_ca)
+    """Move each removed node's OWN contributing area onto its surviving target.
 
-    # Update edge-level contributing_area from upstream node
-    for u, _, _, d in graph.edges(keys=True, data=True):
+    ``own_ca`` is the per-node own subcatchment area snapshotted *before* any
+    removal.  Matching calculate_contributing_area's semantics, each surviving
+    node's contributing_area becomes its own area plus the own area of every
+    removed node that drains into it, and each edge carries its upstream node's
+    own area, rather than the previous max(incoming-edge sum, own) conflation.
+    """
+    resolved = _resolve_transitive(node_mapping)
+    merged_own: dict[Any, float] = {}
+    for node, area in own_ca.items():
+        target = resolved.get(node, node)  # removed -> survivor; survivor -> self
+        merged_own[target] = merged_own.get(target, 0.0) + float(area)
+
+    for n in graph.nodes():
+        if n in merged_own:
+            graph.nodes[n]["contributing_area"] = merged_own[n]
+
+    # Edge contributing_area = upstream node's own area (as set by
+    # calculate_contributing_area at geospatial_utilities edge assignment).
+    for u, _v, _k, d in graph.edges(keys=True, data=True):
         d["contributing_area"] = graph.nodes[u].get("contributing_area", 0)
 
 
@@ -550,6 +562,9 @@ def simplify_network(
         return graph
 
     graph = graph.copy()
+    # Snapshot each node's OWN contributing area before any removal, so the
+    # redistribution can move a removed node's own area onto its survivor.
+    own_ca = {n: float(graph.nodes[n].get("contributing_area", 0.0)) for n in graph.nodes}
     n_nodes_before = graph.number_of_nodes()
     n_edges_before = graph.number_of_edges()
 
@@ -575,7 +590,7 @@ def simplify_network(
     node_mapping = {**removed_leaf_map, **removed_chain_map}
 
     # Step 3 -- reassign contributing_area on surviving nodes
-    _redistribute_contributing_area(graph, node_mapping)
+    _redistribute_contributing_area(graph, node_mapping, own_ca)
 
     # Step 4 -- aggregate subcatchments
     subs_path = addresses.model_paths.subcatchments

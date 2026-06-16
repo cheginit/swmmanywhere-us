@@ -65,3 +65,19 @@ def test_dijkstra_pq_turn_cost_skips_nodes_without_coords():
     result = dijkstra_pq(G, [3], angle_scaling=0.3)
     assert result.has_edge(1, 2)
     assert result.has_edge(2, 3)
+
+
+def test_dijkstra_pq_handles_non_orderable_nodes_on_ties():
+    """Equal-distance heap entries must not force comparing node objects.
+
+    The heap carries a monotonic tie-breaker, so two equally-distant,
+    non-orderable nodes never get compared directly (which would raise
+    ``TypeError: '<' not supported``).
+    """
+    outfall, a, b = object(), object(), object()
+    G = nx.MultiDiGraph()
+    G.add_edge(a, outfall, weight=1.0)
+    G.add_edge(b, outfall, weight=1.0)
+    result = dijkstra_pq(G, [outfall])
+    assert result.has_edge(a, outfall)
+    assert result.has_edge(b, outfall)
