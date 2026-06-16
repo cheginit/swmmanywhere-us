@@ -10,7 +10,7 @@ name = "swmmanywhere-us"
 description = "Synthesise Urban Drainage Network Models Anywhere in the US"
 readme = "README.md"
 authors = [ { name = "Taher Chegini", email = "cheginit@gmail.com" } ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
@@ -18,7 +18,6 @@ classifiers = [
   "Operating System :: OS Independent",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
@@ -39,7 +38,6 @@ dependencies = [
   "pyarrow",
   "pydantic",
   "pyproj",
-  "pywbt>=0.2.2",
   "pyyaml",
   "rasterio",
   "rioxarray",
@@ -48,6 +46,7 @@ dependencies = [
   "shapely>=2",
   "tiny-osm",
   "tiny-retriever",
+  "whitebox_workflows",
   "xarray",
 ]
 optional-dependencies.dev = [
@@ -80,8 +79,8 @@ optional-dependencies.swmm = [
   "matplotlib",
   "networkx",
   "orjson",
-  # "pyswmm",
-  # "swmm-toolkit<0.16.1",
+  "pyswmm",
+  "swmm-toolkit!=0.16.1",
 ]
 optional-dependencies.test = [
   "coverage[toml]",
@@ -110,10 +109,10 @@ build.targets.sdist.exclude = [
 ]
 
 [tool.pixi.environments]
-test311 = { features = [ "test", "py311" ] }
+test311 = { features = [ "test", "py312" ] }
 test314 = { features = [ "test", "py314" ] }
 dev = { features = [ "dev", "py314" ] }
-swmm = { features = [ "swmm", "py313" ] }
+swmm = { features = [ "swmm", "py314" ] }
 typecheck = { features = [ "typecheck", "py314" ] }
 lint = { features = [ "lint", "py314" ], no-default-feature = true }
 
@@ -126,19 +125,12 @@ lint = "pre-commit run --all-files"
 pcupdate = "pre-commit autoupdate"
 spell = "codespell -w"
 
-[tool.pixi.feature.py311.dependencies]
-python = "~=3.11.0"
+[tool.pixi.feature.py312.dependencies]
+python = "~=3.12.0"
 libgdal-core = "*"
 hdf5 = "*"
 libnetcdf = "*"
 
-[tool.pixi.feature.py313.dependencies]
-python = "~=3.13.0"
-libgdal-core = "*"
-hdf5 = "*"
-libnetcdf = "*"
-
-# swmm-toolkit = "*"
 [tool.pixi.feature.py314.dependencies]
 python = "~=3.14.0"
 libgdal-core = "*"
@@ -170,7 +162,7 @@ channels = [ "conda-forge" ]
 platforms = [ "linux-64", "osx-64", "osx-arm64", "win-64" ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 100
 exclude = [ ".pixi", "__pycache__" ]
 lint.select = [ "ALL" ]
@@ -192,11 +184,11 @@ lint.ignore = [
   "TC003",   # stdlib typing-only imports are cheap, keep simple for docs
   "TRY301",  # raising within try/except is fine for us
 ]
-lint.per-file-ignores."docs/*.py" = [
+lint.per-file-ignores."docs/**/*.py" = [
   "A001",   # shadowing builtins like `license` is fine for file paths
   "INP001", # no need for init files in docs
 ]
-lint.per-file-ignores."docs/*.{py,ipynb}" = [
+lint.per-file-ignores."docs/**/*.{py,ipynb}" = [
   # notebook-generated files
   "B018",
   "D100",
@@ -204,6 +196,8 @@ lint.per-file-ignores."docs/*.{py,ipynb}" = [
   "E402",
   # we have commented-out code in notebook headers
   "ERA001",
+  # demo notebooks print their results; keep the print calls
+  "T201",
 ]
 lint.per-file-ignores."tests/*.py" = [
   "B015",    # pointless comparison in tests aren't pointless
@@ -245,7 +239,7 @@ skip = "*.inp,*.lock,.pixi/*,*.ipynb"
 expand_tables = [ "tool.git-cliff", "tool.pixi" ]
 
 [tool.pyright]
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 typeCheckingMode = "strict"
 include = [ "src" ]
 ignore = [
