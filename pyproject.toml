@@ -46,7 +46,7 @@ dependencies = [
   "shapely>=2",
   "tiny-osm",
   "tiny-retriever",
-  "whitebox_workflows",
+  "whitebox-workflows",
   "xarray",
 ]
 optional-dependencies.dev = [

@@ -213,7 +213,7 @@ def test_pipe_by_pipe_no_adverse_slopes():
     """Pass 5 carving repairs adverse residue where it is feasible to do so.
 
     Terrain rises a modest 1.0 m over the first pipe, so Step C leaves the
-    downstream invert mildly adverse; Pass 5 must carve the downstream path, 
+    downstream invert mildly adverse; Pass 5 must carve the downstream path,
     within the max_depth budget, until every street pipe is strictly positive.
     """
     G = nx.MultiDiGraph()

@@ -373,7 +373,7 @@ def _pair_rivers(  # noqa: C901, PLR0912, PLR0915 - river/water-body/pond pairin
 
     # Add edges between the dummy river sinks and their street nodes
     for street_id, river_id in matched_outfalls.items():
-        # ``weight`` is the constant clustering cost the MST selects on, 
+        # ``weight`` is the constant clustering cost the MST selects on,
         # distance-based weights were tested and degrade outfall placement.
         # The dummy sink is a fabricated point (arbitrary location), so the
         # conduit has no real geometric length; the clustering cost doubles as
@@ -570,7 +570,7 @@ def _connect_mst_outfalls(
     # nodes near rivers will always just pick their nearest river node.
     #
     # Select on ``mst_cost``: the constant clustering ``weight`` for outfall
-    # links (so draining directly is a fixed penalty, never the real distance, 
+    # links (so draining directly is a fixed penalty, never the real distance,
     # distance-based selection degrades placement) and the geometric ``length``
     # for everything else (pipes, plus the zeroed river/waste edges).  Outfall
     # ``length`` now carries the real conduit distance, so it must not drive

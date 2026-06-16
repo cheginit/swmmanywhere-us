@@ -760,7 +760,7 @@ def _floodfill_component_ids(
                 if ov > best_ov:
                     best_ov, best_j = ov, j
             # require a real (non-zero) shared border, not just a
-            # bbox-prefilter hit, before adopting the neighbor's id, 
+            # bbox-prefilter hit, before adopting the neighbor's id,
             # otherwise a component could glue to a sub it doesn't touch
             # and stay disconnected.  Untouched comps wait for a later
             # iteration (a closer comp resolves) or the island fallback.
@@ -1082,7 +1082,7 @@ def derive_subcatchments(
     # Repair disconnected (MultiPolygon) subcatchments.  WBT's raster
     # Watershed occasionally assigns a detached sliver to a pour point
     # whose main body is elsewhere (D8 divide / raster-resolution
-    # artifact).  A subcatchment must be a single contiguous polygon, 
+    # artifact).  A subcatchment must be a single contiguous polygon,
     # otherwise any pondshed built by unioning subs inherits the
     # disconnection.  Each detached part is reassigned to the adjacent
     # subcatchment it shares the longest boundary with (falls back to

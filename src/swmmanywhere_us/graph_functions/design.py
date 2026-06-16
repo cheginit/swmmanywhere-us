@@ -919,7 +919,7 @@ def enforce_outfall_slope(  # noqa: C901 - one pass over outfall edges, two feas
         d["length"] = required_length
         # Keep the shapely geometry but set its parametric length to
         # match so downstream consumers (INP writer, visualizations)
-        # see a consistent number.  We do NOT move node coordinates, 
+        # see a consistent number.  We do NOT move node coordinates,
         # the new length is an effective / hydraulic length for the
         # "walked" outfall.
         stretched += 1

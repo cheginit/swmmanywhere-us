@@ -261,7 +261,7 @@ def cleanup_orphan_subcatchments(
     # Do NOT dissolve subcatchments that now share an outlet id.  SWMM fully
     # supports many subcatchments draining to one node, and dissolving by
     # outlet collapses the fine per-pipe subcatchments into mega-subcatchments
-    #, in pond models dozens of subs route to one pond storage and would
+    # , in pond models dozens of subs route to one pond storage and would
     # merge into a single 100+ ha polygon (the small pipe subcatchments
     # "disappearing").  Each sub keeps its own polygon and area; unique SWMM
     # names are assigned at write time (``synthetic_write``).  Pondshed

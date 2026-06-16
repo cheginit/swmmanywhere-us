@@ -230,13 +230,13 @@ class PondDesign(BaseModel):
     References:
         FDOT Drainage Design Guide, Chapter 9.
         Opti CMAC Controllable Volume Implementation Guidelines.
-        Richardson et al. 2022, *Scientific Reports* 12:10472, 
+        Richardson et al. 2022, *Scientific Reports* 12:10472,
             functional definition separating ponds (<=5 ha, <=5 m, <30%
             emergent vegetation) from lakes and wetlands.
         Harper & Baker 2007, *Evaluation of Current Stormwater Design
-            Criteria within the State of Florida*, FDEP final report, 
+            Criteria within the State of Florida*, FDEP final report,
             Florida stormwater-pond calibration envelope (<=2 ha, 3-6 ft).
-        Wetzel 2001, *Limnology: Lake and River Ecosystems* (3rd ed.), 
+        Wetzel 2001, *Limnology: Lake and River Ecosystems* (3rd ed.),
             limnological pond threshold (~2 ha, <3 m).
     """
 

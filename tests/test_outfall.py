@@ -182,7 +182,7 @@ def test_pair_rivers_pond_intake_edges() -> None:
     assert all(d["weight"] == 40.0 for d in intakes.values())
 
 
-def test_prune_uphill_matches(tmp_path: "Path") -> None:
+def test_prune_uphill_matches(tmp_path: Path) -> None:
     """Matches to receiving water above the street surface are dropped; below are kept."""
     import numpy as np
     import rasterio
@@ -195,8 +195,16 @@ def test_prune_uphill_matches(tmp_path: "Path") -> None:
     dem[:, 30:] = 100.0
     dem_path = tmp_path / "dem.tif"
     with rasterio.open(
-        dem_path, "w", driver="GTiff", height=n, width=n, count=1, dtype="float32",
-        crs=CRS, transform=from_origin(0.0, n * res, res, res), nodata=-9999.0,
+        dem_path,
+        "w",
+        driver="GTiff",
+        height=n,
+        width=n,
+        count=1,
+        dtype="float32",
+        crs=CRS,
+        transform=from_origin(0.0, n * res, res, res),
+        nodata=-9999.0,
     ) as dst:
         dst.write(dem, 1)
 
@@ -209,11 +217,13 @@ def test_prune_uphill_matches(tmp_path: "Path") -> None:
     kept, pruned = _prune_uphill_matches(
         {1: 0}, [high_wb], pipe_points, g, dem_path, to_exterior=True
     )
-    assert kept == {} and pruned == 1
+    assert kept == {}
+    assert pruned == 1
 
     # Water body in the LOW half (shoreline DEM ~0 < street 5) -> kept.
     low_wb = box(100.0, 290.0, 150.0, 310.0)
     kept2, pruned2 = _prune_uphill_matches(
         {1: 0}, [low_wb], pipe_points, g, dem_path, to_exterior=True
     )
-    assert kept2 == {1: 0} and pruned2 == 0
+    assert kept2 == {1: 0}
+    assert pruned2 == 0

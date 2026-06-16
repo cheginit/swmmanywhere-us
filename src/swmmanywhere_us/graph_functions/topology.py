@@ -386,7 +386,7 @@ def _reattach_rivers(  # noqa: C901 - order-dependent sequential re-add of river
     Only outfall edges whose street-side node (``u``) survived topology
     derivation are reattached, linking the pipe network to the river
     network.  Pond_connector edges are reattached whenever their
-    ``downstream_network`` endpoint is present in the reattached graph, 
+    ``downstream_network`` endpoint is present in the reattached graph,
     a street node that survived derivation or a re-added river node; the
     pond storage node itself is preserved in ``pond_data`` and re-added
     here.
