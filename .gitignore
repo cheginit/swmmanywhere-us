@@ -23,6 +23,9 @@ cache/
 data/
 WBT/
 
+# Reference papers and development notes (kept locally, not version-controlled)
+docs/references/
+
 # IDE
 .vscode/
 .idea/
