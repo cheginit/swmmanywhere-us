@@ -1,0 +1,43 @@
+package:
+  name: swmm-solver
+  version: 5.2.4
+
+# Standalone EPA SWMM engine: builds the `runswmm` command-line executable (and
+# its libswmm5 library) from source.  This is the model engine only -- no Python
+# bindings (swmm-toolkit/pyswmm), so no SWIG/Python/abi3 wheel and none of the
+# macOS code-signing problems that the prebuilt toolkit wheels hit under pixi.
+source:
+  git: https://github.com/pyswmm/Stormwater-Management-Model.git
+  rev: c85d21272aa1bf6c6f5c33e378dac831d5468438  # develop @ 5.2.4-dev (2025-09)
+
+build:
+  number: 0
+
+requirements:
+  build:
+  - ${{ compiler('c') }}
+  - ${{ compiler('cxx') }}
+  - cmake >=3.23
+  - if: unix
+    then: make
+    else: ninja
+  host:
+  - if: osx
+    then: llvm-openmp
+  - if: linux
+    then: libgomp
+  - if: win
+    then: vcomp14
+  run:
+  - if: osx
+    then: llvm-openmp
+
+tests:
+- package_contents:
+    bin:
+    - runswmm
+
+about:
+  homepage: https://github.com/pyswmm/Stormwater-Management-Model
+  summary: EPA Storm Water Management Model (SWMM) command-line engine
+  license: CC0-1.0

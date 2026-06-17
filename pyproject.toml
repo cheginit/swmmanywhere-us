@@ -138,7 +138,12 @@ hdf5 = "*"
 libnetcdf = "*"
 
 [tool.pixi.feature.swmm.dependencies]
-pyswmm = "*"
+# The EPA SWMM engine (`runswmm` CLI), built from source by ./swmm-solver via
+# pixi-build (see [tool.pixi.workspace] preview).  This replaces pyswmm /
+# swmm-toolkit: the package only needs to RUN SWMM on a generated .inp and read
+# the .rpt/.out, so a conda-compiled engine avoids the toolkit's malformed-wheel
+# and macOS code-signing problems entirely.
+swmm-solver = { path = "./swmm-solver" }
 
 [tool.pixi.feature.test.tasks]
 test = { cmd = [
@@ -160,6 +165,7 @@ swmmanywhere-us = { path = ".", editable = true }
 [tool.pixi.workspace]
 channels = [ "conda-forge" ]
 platforms = [ "linux-64", "osx-64", "osx-arm64", "win-64" ]
+preview = [ "pixi-build" ]
 
 [tool.ruff]
 target-version = "py312"
