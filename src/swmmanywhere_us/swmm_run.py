@@ -12,23 +12,20 @@ The attribute enums and the by-name element lookup mirror the official EPA
 Cython); the only deliberate difference is that the series accessors return
 numpy arrays aligned to ``times`` rather than ``{datetime: value}`` maps.
 
-The results are exposed per element *by name*, so downstream code can pull the
-series it needs for a specific node or link, e.g. to visualize a pondshed
-outlet, a pond's stored volume, or its inflow / outflow::
+Results are exposed per element *by name*, so downstream code can pull the
+series it needs for a specific node or link, e.g. to visualize an outfall
+hydrograph, a pondshed outlet, a pond's stored volume, or its inflow / outflow::
 
-    from swmm_results import SwmmResults, run_swmm, NodeAttr, LinkAttr
+    from swmmanywhere_us.swmm_run import SwmmResults, SystemAttr, run_swmm
 
     rpt, out = run_swmm("model.inp")
     with SwmmResults(out) as res:
-        t = res.times_hours                          # report-step time axis
-        vol = res.node_series("Pond3", NodeAttr.VOLUME)        # pond storage (m3)
-        qin = res.node_series("Pond3", NodeAttr.TOTAL_INFLOW)  # pond inflow
-        qout = res.link_series("Pond3-orifice", LinkAttr.FLOW) # pond outflow
-        qshed = res.node_series("Outfall7", NodeAttr.TOTAL_INFLOW)  # pondshed outlet
+        t = res.times_hours                                # report-step time axis
+        q = res.system_series(SystemAttr.OUTFALL_FLOW)     # total outfall discharge
 
 Run it directly for a quick summary + a system-outfall plot::
 
-    .../.pixi/envs/swmm/bin/python docs/swmm_results.py model_dir_or_inp
+    pixi run -e swmm python -m swmmanywhere_us.swmm_run model_dir_or_inp
 """
 
 from __future__ import annotations
@@ -372,18 +369,9 @@ def _demo(target: str) -> None:
     if target.is_dir():
         sim = target / f"{target.name}_sim.inp"
         target = sim if sim.exists() else target / f"{target.name}.inp"
-    rpt, out = run_swmm(target)
-    print(f"ran {target.name} -> {rpt.name}, {out.name}")
+    _rpt, out = run_swmm(target)
     with SwmmResults(out) as res:
-        print(
-            f"{res.n_node} nodes, {res.n_link} links, {res.n_subcatch} subcatchments; "
-            f"{res.n_periods} periods @ {res.report_step}s; flow units {res.flow_units}"
-        )
         q = res.system_series(SystemAttr.OUTFALL_FLOW)
-        print(
-            f"system outfall flow: peak {q.max():.0f} {res.flow_units}, "
-            f"first node {res.node_names[0]!r}, first link {res.link_names[0]!r}"
-        )
         try:
             import matplotlib as mpl
 
@@ -401,9 +389,8 @@ def _demo(target: str) -> None:
             png = Path(target).with_name(f"{Path(target).stem}_outfall.png")
             fig.tight_layout()
             fig.savefig(png, dpi=130)
-            print(f"wrote {png}")
         except ImportError:
-            print("(matplotlib not available; skipped plot)")
+            pass
 
 
 if __name__ == "__main__":
