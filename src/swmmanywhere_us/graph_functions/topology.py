@@ -476,6 +476,14 @@ def derive_topology(
     graph.remove_nodes_from(set(graph.nodes) - visited)
     graph = filter_edges(graph, frozenset({"pipe"}))
 
+    # A pond can be designated an outfall (it carries an outfall edge) while
+    # also being a pond_connector's water_body endpoint.  filter_edges drops
+    # such pond nodes from the pipe graph (the pond's outfall/connector edges
+    # are reattached later), so they must be dropped from the outfalls list
+    # too -- otherwise dijkstra_pq would seed its search from a node that no
+    # longer exists in the graph.
+    outfalls = [o for o in outfalls if o in graph]
+
     # dijkstra_pq requires non-negative edge weights.  calculate_weights
     # normalizes every factor into a strictly positive range, so this guards
     # against a future regression rather than a live case, and replaces an

@@ -67,6 +67,24 @@ def test_dijkstra_pq_turn_cost_skips_nodes_without_coords():
     assert result.has_edge(2, 3)
 
 
+def test_dijkstra_pq_skips_outfalls_absent_from_graph():
+    """A stray outfall (e.g. a pond dropped by edge filtering) is ignored.
+
+    derive_topology builds the outfalls list before filtering the graph to
+    pipe edges; a pond that is both an outfall and a pond_connector endpoint
+    is then removed, leaving its id in the list.  Seeding the search from it
+    must not raise ``KeyError`` deep in the relaxation loop.
+    """
+    G = nx.MultiDiGraph()
+    G.add_edge(1, 2, weight=1.0)
+    G.add_edge(2, 3, weight=1.0)
+    # 99 is not a node in G; it must be silently skipped, real outfall still wins.
+    result = dijkstra_pq(G, [3, 99])
+    assert result.has_edge(1, 2)
+    assert result.has_edge(2, 3)
+    assert 99 not in result
+
+
 def test_dijkstra_pq_handles_non_orderable_nodes_on_ties():
     """Equal-distance heap entries must not force comparing node objects.
 

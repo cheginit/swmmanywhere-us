@@ -134,7 +134,12 @@ def dijkstra_pq(  # noqa: C901
     pred: dict[Hashable, Any] = {}
     root: dict[Hashable, Any] = {}
 
-    # Set the shortest path length to 0 for outfalls
+    # Seed the search from outfalls.  Guard against outfalls absent from the
+    # graph: seeding from one would push a node onto the heap whose
+    # ``graph._pred[node]`` lookup later raises a cryptic KeyError deep in the
+    # relaxation loop.  Callers should pass only graph-resident outfalls, but
+    # silently skipping strays keeps a stale list from blowing up the search.
+    outfalls = [o for o in outfalls if o in graph]
     for outfall in outfalls:
         shortest_paths[outfall] = 0
         root[outfall] = outfall
