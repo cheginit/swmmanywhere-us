@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from rasterio.warp import transform_bounds
 
 import swmmanywhere_us.geospatial_utilities as go
-from swmmanywhere_us import filepaths, parameters, prepare_data, preprocessing
+from swmmanywhere_us import filepaths, parameters, prepare_data, preprocessing, storms
 from swmmanywhere_us.geopackage import write_geopackage
 from swmmanywhere_us.graph_utilities import filter_edges, save_graph
 from swmmanywhere_us.logging import logger
@@ -82,6 +82,31 @@ class BboxConfig(BaseModel):
     buffer_km: float = 1
 
 
+class NrcsStorm(BaseModel):
+    """Configurable NRCS (SCS) design storm built from the NOAA Atlas 14 depth.
+
+    An alternative to supplying ``rain_dat_path`` (set one or the other, not
+    both): SWMManywhere queries the Atlas-14 point depth at the model centroid
+    for ``return_period`` / ``duration`` and distributes it with the SCS
+    Type II/III 24-hour curve (see :mod:`swmmanywhere_us.storms`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # III = Gulf of Mexico / Atlantic coast (incl. Florida); II = rest of the US.
+    storm_type: Literal["II", "III"] = "III"
+    # Atlas-14 ARI columns (years); FL 25-yr/24-hr is the detention-design basis.
+    return_period: Literal[1, 2, 5, 10, 25, 50, 100, 200, 500, 1000] = 25
+    # Atlas-14 duration row + storm span.  Only "24-hr" matches the native SCS
+    # distribution; shorter spans stretch the 24-h curve (depth exact, peak approx).
+    duration: Literal[
+        "5-min", "10-min", "15-min", "30-min", "60-min", "2-hr", "3-hr", "6-hr", "12-hr", "24-hr"
+    ] = "24-hr"
+    tail_hours: float = Field(default=24.0, ge=0)  # sim time after the storm, for pond drawdown
+    timestep_min: int = Field(default=6, gt=0)  # hyetograph resolution (must divide the duration)
+    fallback_depth_mm: float = Field(default=152.4, gt=0)  # used, with a warning, if NOAA fails
+
+
 class SwmmSettings(BaseModel):
     """SWMM simulation settings."""
 
@@ -89,6 +114,7 @@ class SwmmSettings(BaseModel):
 
     rain_dat_path: Path | None = None
     rain_dat_unit: Literal["IN", "MM"] = "MM"
+    nrcs_storm: NrcsStorm | None = None
     inp_options: SWMMOptions = Field(default_factory=SWMMOptions)
 
 
@@ -141,6 +167,83 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _resolve_rain_source(
+    swmm_settings: dict[str, Any],
+    center_lat: float,
+    center_lon: float,
+    cache_dir: Path,
+    model_dir: Path,
+) -> tuple[Path | None, str, float, bool]:
+    """Resolve the SWMM rain input from the two supported options.
+
+    Either ``rain_dat_path`` (an explicit ``.dat``) or ``nrcs_storm`` (a
+    configured NRCS design storm synthesized from the NOAA Atlas 14 depth) --
+    not both.  When neither is set, returns ``None`` so a placeholder burst is
+    written downstream.
+
+    Returns ``(rain_dat_path, rain_dat_unit, sim_tail_hours, rain_is_user_supplied)``.
+    """
+    user_path = swmm_settings.get("rain_dat_path")
+    nrcs = swmm_settings.get("nrcs_storm")
+    if nrcs is not None and user_path is not None:
+        msg = "Set either swmm_settings.rain_dat_path or swmm_settings.nrcs_storm, not both."
+        raise ValueError(msg)
+    if nrcs is None:
+        return user_path, swmm_settings.get("rain_dat_unit", "MM"), 0.0, user_path is not None
+
+    # NRCS storm: anchor it to the configured simulation start so the window and
+    # the rain can never drift apart, and write it in MM (Atlas-14 is mm-native).
+    inp_opts = swmm_settings.get("inp_options") or {}
+    start_date = inp_opts.get("start_date")
+    start = f"{start_date} {inp_opts.get('start_time') or '00:00:00'}" if start_date else None
+    dur = nrcs["duration"]
+    if inp_opts.get("end_date"):
+        logger.warning(
+            "swmm_settings.inp_options.end_date is set alongside an NRCS storm; it overrides the "
+            f"{nrcs['tail_hours']:g}-hour drawdown tail and may clip the storm/recession."
+        )
+    if dur != "24-hr":
+        logger.warning(
+            f"NRCS storm duration {dur!r} != '24-hr': the 24-hour SCS Type {nrcs['storm_type']} "
+            "curve is stretched to that span (total depth is exact; peak intensity is approximate)."
+        )
+    try:
+        intensity_m_hr = prepare_data.get_design_precipitation(
+            center_lat,
+            center_lon,
+            return_period=nrcs["return_period"],
+            duration=dur,
+            cache_dir=cache_dir,
+        )
+        # Atlas-14 intensities are whole mm/hr, so the depth inherits ~integer-mm/hr
+        # quantization (e.g. 6 mm/hr * 24 h = 144 mm, true band ~[132, 156)).
+        depth_mm = intensity_m_hr * 1000.0 * storms.duration_hours(dur)
+        logger.info(
+            f"NRCS Type {nrcs['storm_type']} {nrcs['return_period']}-yr {dur} design storm: "
+            f"{depth_mm:.0f} mm total (NOAA Atlas 14 at {center_lat:.3f}, {center_lon:.3f})"
+        )
+    except Exception:  # noqa: BLE001 - network/parse errors fall back to a regional depth
+        depth_mm = float(nrcs["fallback_depth_mm"])
+        logger.warning(
+            f"NOAA Atlas 14 lookup failed; using fallback design depth {depth_mm:.0f} mm. "
+            f"Set swmm_settings.nrcs_storm.fallback_depth_mm for your region."
+        )
+    df = storms.build_nrcs_hyetograph(
+        depth_mm,
+        storm_type=nrcs["storm_type"],
+        duration=dur,
+        dt_min=nrcs["timestep_min"],
+        start=start,
+        rain_dat_unit="MM",
+    )
+    dat_path = storms.write_rain_dat(
+        df,
+        model_dir / "storm.dat",
+        comment=f"NRCS Type {nrcs['storm_type']} {nrcs['return_period']}-yr {dur} ({depth_mm:.0f} mm)",
+    )
+    return dat_path, "MM", float(nrcs["tail_hours"]), False
+
+
 def swmmanywhere(config: dict[str, Any]) -> Path:
     """Run SWMManywhere-US to generate a synthetic SWMM network.
 
@@ -188,19 +291,26 @@ def swmmanywhere(config: dict[str, Any]) -> Path:
             logger.info(f"Setting {category} {key} to {val}")
             setattr(params[category], key, val)
 
-    # Query NOAA Atlas 14 for design precipitation if not explicitly set
+    # Model centroid (EPSG:4326), computed unconditionally so it is available
+    # for both the pipe-sizing precip lookup and the NRCS design storm even when
+    # hd.precipitation is user-overridden.  config["bbox"] is (xmin/lon, ymin/lat,
+    # xmax/lon, ymax/lat) at this point.
+    bbox = config["bbox"]
+    center_lat = (bbox[1] + bbox[3]) / 2
+    center_lon = (bbox[0] + bbox[2]) / 2
+    cache_dir = config["base_dir"] / ".cache"
+
+    # Query NOAA Atlas 14 for design precipitation (rational-method pipe sizing)
+    # if not explicitly set.  This is distinct from the SWMM rain input below.
     hd = params["hydraulic_design"]
     if hd.precipitation == HydraulicDesign().precipitation:
-        bbox = config["bbox"]
-        center_lat = (bbox[1] + bbox[3]) / 2
-        center_lon = (bbox[0] + bbox[2]) / 2
         try:
             hd.precipitation = prepare_data.get_design_precipitation(
                 center_lat,
                 center_lon,
                 return_period=hd.design_return_period,
                 duration=hd.design_duration,
-                cache_dir=config["base_dir"] / ".cache",
+                cache_dir=cache_dir,
             )
         except Exception:  # noqa: BLE001 - best-effort: network errors, CSV parse errors, etc. fall back to default precip
             logger.warning(
@@ -239,13 +349,18 @@ def swmmanywhere(config: dict[str, Any]) -> Path:
         logger.warning("No edges in graph, returning graph file...")
         return addresses.model_paths.graph
 
+    rain_dat_path, rain_dat_unit, sim_tail_hours, rain_is_user_supplied = _resolve_rain_source(
+        swmm_settings, center_lat, center_lon, cache_dir, addresses.model_paths.model
+    )
     synthetic_write(
         addresses,
-        rain_dat_path=swmm_settings.get("rain_dat_path"),
-        rain_dat_unit=swmm_settings.get("rain_dat_unit", "MM"),
+        rain_dat_path=rain_dat_path,
+        rain_dat_unit=rain_dat_unit,
         inp_options=swmm_settings.get("inp_options"),
         pond_design=params["pond_design"],
         hydraulic_design=params["hydraulic_design"],
+        sim_tail_hours=sim_tail_hours,
+        rain_is_user_supplied=rain_is_user_supplied,
     )
 
     # Visualization aid: per-pond drainage-area polygons.  Only produced

@@ -204,15 +204,55 @@ class SWMMOptions(BaseModel):
         return self
 
     @classmethod
-    def from_rain_data(cls, rain_df: pd.DataFrame, **kwargs: Any) -> Self:
-        """Create SWMMOptions with dates from rain dataframe.
+    def from_rain_data(
+        cls,
+        rain_df: pd.DataFrame,
+        *,
+        sim_tail_hours: float = 0.0,
+        validate_overlap: bool = False,
+        **kwargs: Any,
+    ) -> Self:
+        """Create SWMMOptions with the simulation window derived from rain data.
+
+        START/END default to the rain's first/last timestamp; any ``start_date``/
+        ``end_date`` in ``kwargs`` overrides (filled only when ``None``).  The
+        end is extended by ``sim_tail_hours`` so a post-storm recession (e.g.
+        pond drawdown) is captured instead of truncated at the last rain step.
 
         Args:
-            rain_df: DataFrame with 'date' column
-            **kwargs: Override any default values
+            rain_df: DataFrame with a 'date' column.
+            sim_tail_hours: Hours to extend END past the last rain timestamp.
+            validate_overlap: If True, raise when an explicit start/end window is
+                supplied that does not overlap the rain (avoids silent zero-rain
+                runs for a user-provided .dat).  Keyword-only; never travels
+                through ``inp_options`` (SWMMOptions forbids extra keys).
+            **kwargs: Override any default option values.
         """
+        import pandas as pd
+
         start_dt = rain_df["date"].min()
-        end_dt = rain_df["date"].max()
+        end_dt = rain_df["date"].max() + pd.Timedelta(hours=sim_tail_hours)
+
+        if validate_overlap and (kwargs.get("start_date") or kwargs.get("end_date")):
+            win_start = (
+                pd.to_datetime(f"{kwargs['start_date']} {kwargs.get('start_time') or '00:00:00'}")
+                if kwargs.get("start_date")
+                else start_dt
+            )
+            win_end = (
+                pd.to_datetime(f"{kwargs['end_date']} {kwargs.get('end_time') or '23:59:00'}")
+                if kwargs.get("end_date")
+                else end_dt
+            )
+            rain_lo, rain_hi = rain_df["date"].min(), rain_df["date"].max()
+            if rain_hi < win_start or rain_lo > win_end:
+                msg = (
+                    f"Rain data spans [{rain_lo}, {rain_hi}] but the simulation window is "
+                    f"[{win_start}, {win_end}] -- they do not overlap, so the run would see zero "
+                    f"rainfall. Align swmm_settings.inp_options start/end dates with the rain .dat, "
+                    f"or drop the date overrides to derive the window from the rain."
+                )
+                raise ValueError(msg)
 
         defaults = {
             "start_date": start_dt.strftime("%m/%d/%Y"),

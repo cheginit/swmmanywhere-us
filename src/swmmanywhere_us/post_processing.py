@@ -48,43 +48,41 @@ def _weir_discharge_coeff(weir_cw_us: float, flow_units: str) -> float:
     return weir_cw_us if flow_units in _US_FLOW_UNITS else weir_cw_us * _WEIR_CW_US_TO_SI
 
 
-def _read_rain_dat_file(dat_file: str | Path | None, base_dir: Path) -> tuple[Path, pd.DataFrame]:
+def _read_rain_dat_file(
+    dat_file: str | Path | None,
+    base_dir: Path,
+    *,
+    start: str | pd.Timestamp | None = None,
+) -> tuple[Path, pd.DataFrame]:
     """Read the rain data from a DAT file.
 
     Args:
-        dat_file (Path): The path to the DAT file. If not provided,
-        a storm event will be created with the following parameters:
-
-            ;File: "storm.dat"
-            1   2000 01 01 00 00    0.0
-            1   2000 01 01 00 05    28
-            1   2000 01 01 00 10    32
-            1   2000 01 01 00 15    3
-        base_dir (Path): The base directory to copy the DAT file to.
-        This option is only used if ``dat_file`` is not provided.
-
+        dat_file (Path): The path to the DAT file. If not provided, a minimal
+            placeholder burst is written (a 15-minute event; values are
+            intensities in the model's rain units, mm/hr by default).  For a
+            realistic event use ``swmm_settings.nrcs_storm`` (see
+            :mod:`swmmanywhere_us.storms`) or pass an explicit ``rain_dat_path``.
+        base_dir (Path): The base directory to write the placeholder DAT to.
+            Only used if ``dat_file`` is not provided.
+        start: Timestamp (or 'MM/DD/YYYY HH:MM:SS' string) anchoring the
+            placeholder burst, so it always falls inside the simulation window.
+            Defaults to 2000-01-01.  Ignored when ``dat_file`` is given.
 
     Returns:
         pd.DataFrame: The rain data as a DataFrame.
     """
     if dat_file is None:
+        anchor = pd.Timestamp("2000-01-01") if start is None else pd.Timestamp(start)
         dat_file = base_dir / "storm.dat"
-        file_content = f""";File: {dat_file}
-1   2000 01 01 00 00    0.0
-1   2000 01 01 00 05    28
-1   2000 01 01 00 10    32
-1   2000 01 01 00 15    3
-"""
-        dat_file.write_text(file_content)
-        return dat_file, pd.DataFrame(
-            {
-                "rain_gage": [1, 1, 1, 1],
-                "date": pd.to_datetime(
-                    ["2000-01-01 00:00", "2000-01-01 00:05", "2000-01-01 00:10", "2000-01-01 00:15"]
-                ),
-                "value": [0.0, 28, 32, 3],
-            }
+        times = [anchor + pd.Timedelta(minutes=m) for m in (0, 5, 10, 15)]
+        values = [0.0, 28.0, 32.0, 3.0]
+        lines = [f";File: {dat_file}"]
+        lines.extend(
+            f"1   {t.year} {t.month:02d} {t.day:02d} {t.hour:02d} {t.minute:02d}    {v:g}"
+            for t, v in zip(times, values, strict=True)
         )
+        dat_file.write_text("\n".join(lines) + "\n")
+        return dat_file, pd.DataFrame({"rain_gage": [1, 1, 1, 1], "date": times, "value": values})
 
     try:
         df = pd.read_csv(
@@ -153,6 +151,9 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     inp_options: dict[str, Any] | None = None,
     pond_design: PondDesign | None = None,
     hydraulic_design: HydraulicDesign | None = None,
+    *,
+    sim_tail_hours: float = 0.0,
+    rain_is_user_supplied: bool = False,
 ):
     """Load synthetic data and write to SWMM input file.
 
@@ -200,7 +201,15 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     # that get mangled during GeoJSON round-trip serialization.
     full_graph = load_graph(addresses.model_paths.graph)
 
-    rain_dat, rain = _read_rain_dat_file(rain_dat_path, addresses.model_paths.model)
+    _opts = inp_options or {}
+    _start_anchor = (
+        f"{_opts['start_date']} {_opts.get('start_time') or '00:00:00'}"
+        if _opts.get("start_date")
+        else None
+    )
+    rain_dat, rain = _read_rain_dat_file(
+        rain_dat_path, addresses.model_paths.model, start=_start_anchor
+    )
 
     gage_id = rain["rain_gage"].unique()
     if len(gage_id) != 1:
@@ -1081,7 +1090,9 @@ def synthetic_write(  # noqa: C901, PLR0912, PLR0915 - end-to-end graph -> SWMM 
     }
 
     inp_options = {} if inp_options is None else inp_options
-    options = SWMMOptions.from_rain_data(rain, **inp_options)
+    options = SWMMOptions.from_rain_data(
+        rain, sim_tail_hours=sim_tail_hours, validate_overlap=rain_is_user_supplied, **inp_options
+    )
     generator = SwmmInputGenerator(
         title="SWMManywhere Generated Model",
         options=options,
